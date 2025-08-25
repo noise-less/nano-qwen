@@ -1,6 +1,6 @@
 torch
 safetensors==0.5.3
-datasets==3.6.0
+wandb==0.21.1
 tokenizers==0.21.1 
 huggingface_hub==0.31.1
 accelerate==1.6.0
