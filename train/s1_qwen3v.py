@@ -1,182 +1,260 @@
 import torch
-import torch.nn as nn
-from typing import Optional
+import math
 
-from PIL import Image
 from model.processor import Processor
-from model.vision import VisionConfig, Qwen2VLVisionEncoder
-from model.qwen3 import Qwen3Config, Qwen3Dense
+from model.qwen3v import Qwen3V
 
-from data.llava import LLaVAPretrainDataset, LLaVAInstructDataset
+from data.llava import LLaVAPretrainDataset
+from torch.nn.utils.rnn import pad_sequence
 
 
-class Qwen3V(nn.Module):
-    def __init__(self, vision_config: VisionConfig, lm_config: Qwen3Config):
-        super().__init__()
-        self.config = lm_config
-        self.vision_config = vision_config
+def freeze_except_projection(model: Qwen3V):
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.projection.parameters():
+        p.requires_grad = True
+    # keep the frozen parts in eval mode to disable dropout etc.
+    model.visual.eval()
+    model.model.eval()
+    model.train()
 
-        # frozen vision encoder taken from qwen2.5-vl.
-        self.visual = Qwen2VLVisionEncoder(vision_config)
 
-        # the only trainable part of this model.
-        self.projection = nn.Linear(vision_config.output_n_embed, lm_config.n_embed)
+def make_collate_fn(processor: Processor, max_seq_len: int = 2048):
+    # Pick a safe pad id; using <|endoftext|> as a no-op pad token.
+    pad_id = processor.tokenizer.encode("<|endoftext|>").ids[0]
+    img_pad_id = processor.image_pad_token_id
 
-        # frozen qwen3 model.
-        self.model = Qwen3Dense(lm_config)
-        self.lm_head = None
-        if not lm_config.tie_word_embeddings:
-            self.lm_head = nn.Linear(
-                lm_config.n_embed, lm_config.vocab_size, bias=False
-            )
+    def collate(batch):
+        input_ids_list = []
+        labels_list = []
+        pixels_list = []
+        d_image_list = []
 
-        # Constants for vision tokens
-        self.image_pad_token_id = 151655
+        for ex in batch:
+            # Processor builds the text+image sequence with <|image_pad|> block(s)
+            out = processor(messages=ex["messages"], device=None)
 
-    def _get_position_ids(
-        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        # Copy directly from Qwen2VL._get_position_ids()
-        B, T = input_ids.shape
-        device = input_ids.device
-        all_pos_ids = torch.zeros(B, 3, T, dtype=torch.long, device=device)
+            ids = out["input_ids"].squeeze(0)  # (T,)
+            pix = out["pixels"]  # (num_patches, patch_dim) or None
+            dimg = out["d_image"]  # (num_images, 3) or None
 
-        for batch_idx in range(B):
-            seq = input_ids[batch_idx]
-            seq_idx = 0
-            image_idx = 0
-            pos_chunks = []
-            position_id = 0
+            # Truncation policy: right-truncate only if necessary.
+            # IMPORTANT: we want to avoid chopping *inside* the image pad block.
+            # For simplicity, if truncation would hit image pads, just skip this sample.
+            if ids.numel() > max_seq_len:
+                # naive check: if any image pad token lies beyond max_seq_len, skip example
+                if (ids[max_seq_len:] == img_pad_id).any():
+                    continue
+                ids = ids[:max_seq_len]
 
-            while seq_idx < T:
-                token_id = seq[seq_idx].item()
-                if token_id == self.image_pad_token_id:
-                    t, h, w = d_image[image_idx]
-                    h = h // self.vision_config.spatial_merge_size
-                    w = w // self.vision_config.spatial_merge_size
+            input_ids_list.append(ids)
 
-                    t_idx = torch.arange(t).view(t, 1).expand(t, h * w).flatten()
-                    h_idx = torch.arange(h).view(1, h, 1).expand(t, h, w).flatten()
-                    w_idx = torch.arange(w).view(1, 1, w).expand(t, h, w).flatten()
+            # Build labels: next-token prediction on all text tokens.
+            # We ignore loss on image pad positions (set to -100 after shift).
+            labels = ids.clone()
+            labels[labels == img_pad_id] = -100
+            labels_list.append(labels)
 
-                    pos_vision = torch.stack([t_idx, h_idx, w_idx]) + position_id
-                    pos_chunks.append(pos_vision)
-                    position_id = pos_vision.max().item() + 1
-                    seq_idx += t * h * w
-                    image_idx += 1
-                else:
-                    pos_text = torch.tensor([position_id])
-                    pos_text = pos_text.unsqueeze(0).expand(3, 1)
-                    pos_chunks.append(pos_text)
-                    position_id += 1
-                    seq_idx += 1
+            if pix is not None:
+                pixels_list.append(pix)  # concat later along dim=0
+                # out["d_image"] is shape (num_images, 3); LLaVA pretrain has exactly 1
+                d_image_list.append(dimg.squeeze(0))  # -> (3,)
 
-            pos_ids_example = torch.cat(pos_chunks, dim=1).to(device)
-            all_pos_ids = pos_ids_example.unsqueeze(1).expand(-1, B, -1)
+        # Dynamic right padding to batch max length
+        if len(input_ids_list) == 0:
+            # rare case: all skipped due to truncation; let DataLoader retry
+            return None
 
-        return all_pos_ids
+        input_ids = pad_sequence(
+            input_ids_list, batch_first=True, padding_value=pad_id
+        )  # (B, T*)
+        labels = pad_sequence(labels_list, batch_first=True, padding_value=-100)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        pixels: Optional[torch.Tensor] = None,
-        d_image: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        input_embeds = self.model.model.embed_tokens(input_ids)
+        # pixel stream: concat all images in the batch (order must match the order
+        # of <|image_pad|> blocks scanned row-major by masked_scatter)
+        pixels = (
+            torch.cat(pixels_list, dim=0) if pixels_list else None
+        )  # (sum_patches, patch_dim)
+        d_image = torch.stack(d_image_list, dim=0) if d_image_list else None  # (B, 3)
 
-        if pixels is not None:
-            # encode images through the vision encoder.
-            image_embeds = self.visual(pixels=pixels, d_image=d_image)
-            # Project vision embeddings to match text embedding dimension
-            image_embeds = self.projection(image_embeds)
-            # create a mask for the image tokens of shape (B, T)
-            image_mask = input_ids == self.image_pad_token_id
-            # expand the mask along embedding dimension to shape (B, T, C)
-            image_mask = image_mask.unsqueeze(-1).expand_as(input_embeds)
-            # replace image pad token embeddings with actual image embeddings
-            input_embeds = input_embeds.masked_scatter(image_mask, image_embeds)
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "pixels": pixels,
+            "d_image": d_image,
+        }
 
-        # Use 3D position ids for multimodal support
-        position_ids = self._get_position_ids(input_ids, d_image)
-        x = self.model.model(x=input_embeds, position_ids=position_ids)
+    return collate
 
-        if self.lm_head is None:
-            logits = torch.matmul(x, self.model.model.embed_tokens.weight.T)
-        else:
-            logits = self.lm_head(x)
-        return logits
+
+def lm_ce_loss(logits, labels):
+    # logits: (B, T, V), labels: (B, T)
+    # shift for next-token prediction
+    logits = logits[:, :-1, :].contiguous()
+    labels = labels[:, 1:].contiguous()
+    return torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+    )
+
+
+def train_projection_only(
+    model: Qwen3V,
+    processor: Processor,
+    dataset,
+    device="cuda",
+    batch_size=8,
+    max_seq_len=2048,
+    lr=5e-4,
+    weight_decay=0.01,
+    num_epochs=1,
+    grad_accum_steps=1,
+    amp=True,
+    num_workers=4,
+    ckpt_path="proj_only.pt",
+):
+    freeze_except_projection(model)
+    model.to(device)
+
+    collate_fn = make_collate_fn(processor, max_seq_len=max_seq_len)
+
+    from torch.utils.data import DataLoader
+
+    def _collate_drop_none(batch):
+        out = collate_fn(batch)
+        # If the collate returned None (e.g., every sample in that mini-batch was skipped),
+        # return an empty batch so DataLoader can continue; we’ll guard in the loop.
+        return out or {"skip": True}
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=_collate_drop_none,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+    )
+
+    # Only projection parameters will be optimized
+    optim = torch.optim.AdamW(
+        model.projection.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=(0.9, 0.95),
+    )
+
+    # Cosine scheduler with linear warmup (tiny and simple)
+    total_steps = max(1, (len(loader) // max(1, grad_accum_steps)) * num_epochs)
+    warmup = max(100, int(0.02 * total_steps))  # 2% or at least 100 steps
+
+    def lr_sched(step):
+        if step < warmup:
+            return step / max(1, warmup)
+        progress = (step - warmup) / max(1, total_steps - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_sched)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+
+    global_step = 0
+    running = 0.0
+    model.train()  # remember: only projection is actually in train mode
+
+    for epoch in range(num_epochs):
+        for batch in loader:
+            if "skip" in batch:
+                continue
+
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            pixels = batch["pixels"]
+            d_image = batch["d_image"]
+
+            if pixels is not None:
+                pixels = pixels.to(device, non_blocking=True)
+            if d_image is not None:
+                d_image = d_image.to(device, non_blocking=True)
+
+            with torch.cuda.amp.autocast(enabled=amp):
+                logits = model(input_ids=input_ids, pixels=pixels, d_image=d_image)
+                loss = lm_ce_loss(logits, labels) / grad_accum_steps
+
+            scaler.scale(loss).backward()
+            running += loss.item() * grad_accum_steps
+
+            if (global_step + 1) % grad_accum_steps == 0:
+                # projection-only grad clip (a little safety)
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(model.projection.parameters(), 1.0)
+
+                scaler.step(optim)
+                scaler.update()
+                optim.zero_grad(set_to_none=True)
+                scheduler.step()
+
+            global_step += 1
+
+            if global_step % 50 == 0:
+                print(
+                    f"[epoch {epoch}] step {global_step} | loss {running/50:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
+                )
+                running = 0.0
+
+        # save projection weights each epoch
+        torch.save(
+            {
+                "projection": model.projection.state_dict(),
+                "optim": optim.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "global_step": global_step,
+            },
+            ckpt_path,
+        )
+        print(f"Saved projection checkpoint to {ckpt_path}")
 
 
 if __name__ == "__main__":
-    # Qwen2.5 VL 7B's vision config:
-    qwen2_5_VL_7B_vision_config_dict = {
-        "n_embed": 1280,
-        "n_layer": 32,
-        "n_heads": 16,
-        "output_n_embed": 3584,
-        "in_channels": 3,
-        "spatial_merge_size": 2,
-        "spatial_patch_size": 14,
-        "temporal_patch_size": 2,
-        "intermediate_size": 3420,
-        "hidden_act": "silu",
-    }
-    qwen2_5_VL_7B_vision_config = VisionConfig(**qwen2_5_VL_7B_vision_config_dict)
-
-    # Qwen3 1.7B's lm config:
-    qwen3_1_7B_lm_config_dict = {
-        "n_embed": 2048,
-        "n_heads": 16,
-        "n_kv_heads": 8,
-        "n_layer": 28,
-        "n_mlp": 6144,
-        "rope_theta": 1000000,
-        "rms_norm_eps": 1e-06,
-        "vocab_size": 151936,
-        "tie_word_embeddings": True,
-        "head_dim": 128,
-        "num_experts": None,
-        "num_experts_per_tok": None,
-        "moe_intermediate_size": None,
-    }
-    qwen3_1_7B_lm_config = Qwen3Config(**qwen3_1_7B_lm_config_dict)
+    model = Qwen3V(model_variant="1.7B").cuda()
 
     processor = Processor(
-        repo_id="Qwen/Qwen2.5-VL-7B-Instruct",
-        vision_config=qwen2_5_VL_7B_vision_config,
+        repo_id="Qwen/Qwen3-1.7B-Instruct",
+        vision_config=model.vision_config,
     )
-    model = Qwen3V(
-        vision_config=qwen2_5_VL_7B_vision_config,
-        lm_config=qwen3_1_7B_lm_config,
-    )
-    model = model.cuda()  # Move model to CUDA
+    pretrain_dataset = LLaVAPretrainDataset(cache_dir="./cache")
 
+    # messages = pretrain_dataset[0]["messages"]
 
-    pretrain_dataset = LLaVAPretrainDataset(
+    # inputs = processor(messages=messages, device="cuda")
+    # print("Input shapes:")
+    # print(f"input_ids: {inputs['input_ids'].shape}")
+    # print(f"pixels: {inputs['pixels']}")
+    # print(f"d_image: {inputs['d_image']}")
+
+    # # Test forward pass
+    # model.eval()
+    # with torch.no_grad():
+    #     logits = model(
+    #         input_ids=inputs["input_ids"],
+    #         pixels=inputs["pixels"],
+    #         d_image=inputs["d_image"],
+    #     )
+    #     print(f"Output logits shape: {logits.shape}")
+
+    train_projection_only(
+        model=model,
         processor=processor,
-        data_dir="data/llava/pretrain",
-        max_length=1024,
+        dataset=pretrain_dataset,
+        device="cuda",
+        batch_size=8,
+        max_seq_len=1024,  # these samples are short; 1024 is plenty
+        lr=5e-4,
+        weight_decay=0.01,
+        num_epochs=1,
+        grad_accum_steps=1,
+        amp=True,
+        num_workers=4,
+        ckpt_path="proj_only.pt",
     )
-    # instruct_dataset = LLaVAInstructDataset(
-    #     processor=processor,
-    #     data_dir="data/llava/instruct",
-    #     max_length=1024,
-    # )
-
-    messages = pretrain_dataset[0]["messages"]
-
-    inputs = processor(messages=messages, device="cuda")
-    print("Input shapes:")
-    print(f"input_ids: {inputs['input_ids'].shape}")
-    print(f"pixels: {inputs['pixels']}")  # Should be None for text-only
-    print(f"d_image: {inputs['d_image']}")  # Should be None for text-only
-
-    # Test forward pass
-    model.eval()
-    with torch.no_grad():
-        logits = model(
-            input_ids=inputs["input_ids"],
-            pixels=inputs["pixels"],
-            d_image=inputs["d_image"],
-        )
-        print(f"Output logits shape: {logits.shape}")
