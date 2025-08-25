@@ -159,6 +159,8 @@ class Qwen3V(nn.Module):
             image_embeds = self.visual(pixels=pixels, d_image=d_image)
             # Project vision embeddings to match text embedding dimension
             image_embeds = self.projection(image_embeds)
+            # Ensure dtype compatibility
+            image_embeds = image_embeds.to(input_embeds.dtype)
             # create a mask for the image tokens of shape (B, T)
             image_mask = input_ids == self.image_pad_token_id
             # expand the mask along embedding dimension to shape (B, T, C)
