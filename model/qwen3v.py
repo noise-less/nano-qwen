@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Optional
 
 from model.vision import VisionConfig, Qwen2VLVisionEncoder
+from model.qwen2_5_vl import Qwen2VL
 from model.qwen3 import Qwen3Config, Qwen3Dense
 
 
@@ -90,7 +91,9 @@ class Qwen3V(nn.Module):
         self.visual = Qwen2VLVisionEncoder(self.vision_config)
 
         # the only trainable part of this model.
-        self.projection = nn.Linear(self.vision_config.output_n_embed, self.lm_config.n_embed)
+        self.projection = nn.Linear(
+            self.vision_config.output_n_embed, self.lm_config.n_embed
+        )
 
         # frozen qwen3 model.
         self.model = Qwen3Dense(self.lm_config)
@@ -177,3 +180,72 @@ class Qwen3V(nn.Module):
         else:
             logits = self.lm_head(x)
         return logits
+
+    def load_vision_weights_from_pretrained(self, vision_model_repo: str):
+        """Load vision encoder weights from a pretrained Qwen2.5-VL model."""
+
+        # Load the full vision model
+        print(f"Loading vision weights from {vision_model_repo}...")
+        vision_model = Qwen2VL.from_pretrained(vision_model_repo)
+
+        # Extract vision encoder state dict
+        vision_state_dict = {}
+        for key, param in vision_model.visual.state_dict().items():
+            vision_state_dict[key] = param
+
+        # Load into our vision encoder
+        missing_keys, unexpected_keys = self.visual.load_state_dict(
+            vision_state_dict, strict=False
+        )
+
+        if missing_keys:
+            print(f"Warning: Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys: {unexpected_keys}")
+
+        print("✓ Vision encoder weights loaded")
+
+        # Clean up
+        del vision_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    def load_text_weights_from_pretrained(self, text_model_repo: str):
+        """Load text model weights from a pretrained Qwen3 model."""
+
+        print(f"Loading text weights from {text_model_repo}...")
+        text_model = Qwen3Dense.from_pretrained(text_model_repo)
+
+        # Load the text model weights
+        missing_keys, unexpected_keys = self.model.load_state_dict(
+            text_model.state_dict(), strict=False
+        )
+
+        if missing_keys:
+            print(f"Warning: Missing keys in text model: {missing_keys}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys in text model: {unexpected_keys}")
+
+        # Also load lm_head if present
+        if hasattr(text_model, "lm_head") and text_model.lm_head is not None:
+            if self.lm_head is not None:
+                self.lm_head.load_state_dict(text_model.lm_head.state_dict())
+                print("✓ LM head weights loaded")
+
+        print("✓ Text model weights loaded")
+
+        # Clean up
+        del text_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    @classmethod
+    def from_pretrained_components(
+        cls,
+        model_variant: str,
+        vision_model_repo: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        text_model_repo: str = "Qwen/Qwen3-8B-Instruct",
+    ):
+        """Create Qwen3V and load weights from separate pretrained components."""
+        model = cls(model_variant)
+        model.load_vision_weights_from_pretrained(vision_model_repo)
+        model.load_text_weights_from_pretrained(text_model_repo)
+        return model

@@ -221,9 +221,13 @@ if __name__ == "__main__":
     #   accelerate config
     #   accelerate launch -m train.s1_qwen3v
 
-    # Model + processor
-    model = Qwen3V(model_variant="1.7B")
-    processor = Processor(repo_id="Qwen/Qwen3-1.7B", vision_config=model.vision_config)
+    # Model + processor - load pretrained weights for vision and text components
+    model = Qwen3V.from_pretrained_components(
+        model_variant="1.7B",
+        vision_model_repo="Qwen/Qwen2.5-VL-3B-Instruct",
+        text_model_repo="Qwen/Qwen3-1.7B-Instruct"
+    )
+    processor = Processor(repo_id="Qwen/Qwen3-1.7B-Instruct", vision_config=model.vision_config)
 
     # Data
     pretrain_dataset = LLaVAPretrainDataset(cache_dir="./cache")
