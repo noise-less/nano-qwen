@@ -266,15 +266,11 @@ class Qwen3V(nn.Module):
         model_variant: str,
         vision_model_repo: str = "Qwen/Qwen2.5-VL-7B-Instruct",
         text_model_repo: str = "Qwen/Qwen3-8B",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """Create Qwen3V and load weights from separate pretrained components."""
         model = cls(model_variant)
         model.load_vision_weights_from_pretrained(vision_model_repo)
         model.load_text_weights_from_pretrained(text_model_repo)
-
-        # Move model to specified device
-        model = model.to(device)
         return model
 
     @torch.no_grad()
