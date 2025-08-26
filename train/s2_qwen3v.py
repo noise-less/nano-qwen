@@ -12,6 +12,18 @@ from model.processor import Processor
 from model.qwen3v import Qwen3V
 from data.llava import LLaVAPretrainDataset
 
+batch_size = 16
+max_seq_len = 1024
+epochs = 1
+grad_accum = 1
+lr = 5e-4
+weight_decay = 0.01
+
+devices = 2
+strategy = "ddp"
+precision = "bf16-mixed"
+model_variant = "1.7B"
+
 
 # ---------- utils ----------
 def freeze_except_projection(model: Qwen3V):
@@ -220,22 +232,20 @@ class VLDataModule(L.LightningDataModule):
         )
 
 
-# ---------- main ----------
 if __name__ == "__main__":
-    # Instantiate model & processor (your helpers)
+    # Load model & processor
+    text_model_repo = f"Qwen/Qwen3-{model_variant}"
+    vision_model_repo = "Qwen/Qwen2.5-VL-7B-Instruct"
+
     model = Qwen3V.from_pretrained_components(
-        model_variant="8B",
-        vision_model_repo="Qwen/Qwen2.5-VL-7B-Instruct",
-        text_model_repo="Qwen/Qwen3-8B",
+        model_variant=model_variant,
+        vision_model_repo=vision_model_repo,
+        text_model_repo=text_model_repo,
     )
-    processor = Processor(repo_id="Qwen/Qwen3-8B", vision_config=model.vision_config)
+    processor = Processor(repo_id=text_model_repo, vision_config=model.vision_config)
 
     # Data
     dataset = LLaVAPretrainDataset(cache_dir="./cache")
-    batch_size = 16
-    max_seq_len = 1024
-    epochs = 1
-    grad_accum = 1
 
     # Schedule math (rough; Lightning also knows steps_per_epoch but we keep your cosine)
     steps_per_epoch = max(1, math.ceil(len(dataset) / batch_size))
@@ -244,8 +254,8 @@ if __name__ == "__main__":
 
     lit = ProjectionOnlyLitModule(
         model=model,
-        lr=5e-4,
-        weight_decay=0.01,
+        lr=lr,
+        weight_decay=weight_decay,
         steps_total=total_steps,
         warmup_steps=warmup,
         log_every=50,
@@ -263,17 +273,15 @@ if __name__ == "__main__":
 
     trainer = L.Trainer(
         accelerator="gpu",
-        devices=8,  # or "auto"
-        strategy="ddp",
-        precision="bf16-mixed",  # bf16 if supported
+        devices=devices,
+        strategy=strategy,
+        precision=precision,  # bf16 if supported
         max_epochs=epochs,
         accumulate_grad_batches=grad_accum,
         logger=logger,
         callbacks=[
             SaveProjectionCallback(ckpt_path="proj_only.pt"),
-            ModelCheckpoint(
-                save_last=True, save_top_k=0
-            ),  # standard full ckpt if you also want it
+            ModelCheckpoint(save_last=True, save_top_k=0),
         ],
         log_every_n_steps=10,
         enable_progress_bar=True,
