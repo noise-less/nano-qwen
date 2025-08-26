@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 from model.vision import VisionConfig, Qwen2VLVisionEncoder
@@ -242,10 +243,50 @@ class Qwen3V(nn.Module):
         cls,
         model_variant: str,
         vision_model_repo: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-        text_model_repo: str = "Qwen/Qwen3-8B-Instruct",
+        text_model_repo: str = "Qwen/Qwen3-8B",
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """Create Qwen3V and load weights from separate pretrained components."""
         model = cls(model_variant)
         model.load_vision_weights_from_pretrained(vision_model_repo)
         model.load_text_weights_from_pretrained(text_model_repo)
+
+        # Move model to specified device
+        model = model.to(device)
         return model
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        pixels: torch.Tensor,
+        d_image: torch.Tensor,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+        stream: bool = False,
+    ):
+        if stop_tokens is None:
+            stop_tokens = [
+                151645,
+                151644,
+                151643,
+            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
+        for _ in range(max_new_tokens):
+            logits = self.forward(input_ids=input_ids, pixels=pixels, d_image=d_image)
+            last_logits = logits[:, -1, :]
+            probs = F.softmax(last_logits, dim=-1)
+            next_token = probs.argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+            # If streaming, yield the new token
+            if stream:
+                yield next_token.item()
+
+            # Check if we hit a stop token
+            if next_token.item() in stop_tokens:
+                break
+
+        # If not streaming, return the full input_ids
+        if not stream:
+            return input_ids
