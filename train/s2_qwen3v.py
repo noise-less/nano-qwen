@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 
-from model.processor import Processor
 from model.qwen3v import Qwen3V
+from model.processor import Processor
 from data.llava import LLaVAPretrainDataset
 
 batch_size = 16
@@ -22,7 +22,7 @@ weight_decay = 0.01
 devices = 2
 strategy = "ddp"
 precision = "bf16-mixed"
-model_variant = "1.7B"
+model_variant = "4B"
 
 
 # ---------- utils ----------

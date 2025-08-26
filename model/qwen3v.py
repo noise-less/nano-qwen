@@ -5,7 +5,7 @@ from typing import Optional
 
 from model.vision import VisionConfig, Qwen2VLVisionEncoder
 from model.qwen2_5_vl import Qwen2VL
-from model.qwen3 import Qwen3Config, Qwen3Dense
+from model.qwen3 import Qwen3Config, Qwen3MoE, Qwen3Dense
 
 
 class Qwen3V(nn.Module):
@@ -14,9 +14,10 @@ class Qwen3V(nn.Module):
 
         assert model_variant in [
             "1.7B",
+            "4B",
             "8B",
-            # "14B",
-        ], "model_variant must be one of 1.7B, 8B"
+            "14B",
+        ], "model_variant must be one of 1.7B, 4B, 8B, 14B"
 
         if model_variant == "1.7B":
             self.lm_config = Qwen3Config(
@@ -36,6 +37,26 @@ class Qwen3V(nn.Module):
                     "moe_intermediate_size": None,
                 }
             )
+            self.model = Qwen3Dense(self.lm_config)
+        elif model_variant == "4B":
+            self.lm_config = Qwen3Config(
+                **{
+                    "n_embed": 2560,
+                    "n_heads": 32,
+                    "n_kv_heads": 8,
+                    "n_layer": 36,
+                    "n_mlp": 9728,
+                    "rope_theta": 5000000,
+                    "rms_norm_eps": 1e-06,
+                    "vocab_size": 151936,
+                    "tie_word_embeddings": True,
+                    "head_dim": 128,
+                    "num_experts": None,
+                    "num_experts_per_tok": None,
+                    "moe_intermediate_size": None,
+                }
+            )
+            self.model = Qwen3MoE(self.lm_config)
         elif model_variant == "8B":
             self.lm_config = Qwen3Config(
                 **{
@@ -54,6 +75,7 @@ class Qwen3V(nn.Module):
                     "moe_intermediate_size": None,
                 }
             )
+            self.model = Qwen3Dense(self.lm_config)
         elif model_variant == "14B":
             self.lm_config = Qwen3Config(
                 **{
@@ -72,6 +94,7 @@ class Qwen3V(nn.Module):
                     "moe_intermediate_size": None,
                 }
             )
+            self.model = Qwen3Dense(self.lm_config)
         else:
             raise ValueError(f"Invalid model variant: {model_variant}")
 
@@ -97,7 +120,6 @@ class Qwen3V(nn.Module):
         )
 
         # frozen qwen3 model.
-        self.model = Qwen3Dense(self.lm_config)
         self.lm_head = None
         if not self.lm_config.tie_word_embeddings:
             self.lm_head = nn.Linear(
@@ -214,7 +236,7 @@ class Qwen3V(nn.Module):
         """Load text model weights from a pretrained Qwen3 model."""
 
         print(f"Loading text weights from {text_model_repo}...")
-        text_model = Qwen3Dense.from_pretrained(text_model_repo)
+        text_model = Qwen3MoE.from_pretrained(text_model_repo)
 
         # Load the text model weights
         missing_keys, unexpected_keys = self.model.load_state_dict(
