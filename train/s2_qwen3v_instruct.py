@@ -1,4 +1,4 @@
-# lightning_qwen3v_projection.py
+# lightning_qwen3v_instruct.py
 import os, math, argparse
 import torch
 import torch.nn.functional as F
@@ -17,7 +17,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 # your modules
 from model.processor import Processor
 from model.qwen3v import Qwen3V
-from data.llava import LLaVAPretrainDataset
+from data.llava import LLaVAInstructDataset
 
 
 # -------------------- utils --------------------
@@ -31,9 +31,13 @@ def freeze_except_projection(model):
     model.train()
 
 
-def make_collate_fn(processor: Processor, max_seq_len: int = 2048):
+def make_instruct_collate_fn(processor: Processor, max_seq_len: int = 2048):
     pad_id = processor.tokenizer.encode("<|endoftext|>").ids[0]
     img_pad_id = processor.image_pad_token_id
+
+    # Get special tokens
+    im_start_id = processor.tokenizer.encode("<|im_start|>").ids[0]
+    im_end_id = processor.tokenizer.encode("<|im_end|>").ids[0]
 
     def collate(batch):
         ids_list, labels_list, pixels_list, dimg_list = [], [], [], []
@@ -49,8 +53,27 @@ def make_collate_fn(processor: Processor, max_seq_len: int = 2048):
                     continue
                 ids = ids[:max_seq_len]
 
-            labels = ids.clone()
-            labels[labels == img_pad_id] = -100
+            # Create labels for instruction tuning - only compute loss on assistant responses
+            labels = torch.full_like(ids, -100)
+
+            # Find assistant response tokens and unmask them for loss computation
+            in_assistant = False
+            for i in range(len(ids)):
+                if ids[i] == im_start_id and i + 1 < len(ids):
+                    # Check if next tokens spell "assistant"
+                    assistant_tokens = processor.tokenizer.encode("assistant").ids
+                    if (
+                        i + 1 + len(assistant_tokens) < len(ids)
+                        and ids[i + 1 : i + 1 + len(assistant_tokens)].tolist()
+                        == assistant_tokens
+                    ):
+                        in_assistant = True
+                elif ids[i] == im_end_id:
+                    in_assistant = False
+                elif in_assistant and ids[i] != img_pad_id:
+                    # Only compute loss on assistant tokens (not image pad tokens)
+                    labels[i] = ids[i]
+
             ids_list.append(ids)
             labels_list.append(labels)
             if pix is not None:
@@ -85,17 +108,18 @@ def lm_ce_loss(logits, labels):
 
 
 # -------------------- LightningModule --------------------
-class ProjectionOnlyLM(L.LightningModule):
+class InstructionTuningLM(L.LightningModule):
     def __init__(
         self,
         model,
-        lr=5e-4,
+        lr=1e-5,
         weight_decay=0.01,
         total_steps=1000,
         warmup_steps=100,
         log_every=50,
         use_act_ckpt=False,
         block_cls=None,
+        freeze_llm=True,
     ):
         super().__init__()
         self.model = model
@@ -106,7 +130,12 @@ class ProjectionOnlyLM(L.LightningModule):
         self.log_every = int(log_every)
         self.use_act_ckpt = use_act_ckpt
         self.block_cls = block_cls
-        freeze_except_projection(self.model)
+
+        if freeze_llm:
+            freeze_except_projection(self.model)
+        else:
+            # For full fine-tuning, keep everything trainable
+            self.model.train()
 
     def forward(self, input_ids, pixels=None, d_image=None):
         return self.model(input_ids=input_ids, pixels=pixels, d_image=d_image)
@@ -129,8 +158,14 @@ class ProjectionOnlyLM(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        # Only optimize projection layer for projection-only training
+        if hasattr(self, "_freeze_llm") and self._freeze_llm:
+            params = self.model.projection.parameters()
+        else:
+            params = self.model.parameters()
+
         optim = torch.optim.AdamW(
-            self.model.projection.parameters(),
+            params,
             lr=self.lr,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
@@ -153,11 +188,11 @@ class ProjectionOnlyLM(L.LightningModule):
 
 # -------------------- Callbacks --------------------
 class SaveProjectionSafetensors(L.Callback):
-    def __init__(self, path: str = "projection.safetensors"):
+    def __init__(self, path: str = "instruct_projection.safetensors"):
         super().__init__()
         self.path = path
 
-    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: ProjectionOnlyLM):
+    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: InstructionTuningLM):
         if trainer.is_global_zero:
             state = {
                 f"projection.{k}": v.detach().cpu()
@@ -168,7 +203,7 @@ class SaveProjectionSafetensors(L.Callback):
 
 
 class PrintEpochSummary(L.Callback):
-    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: ProjectionOnlyLM):
+    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: InstructionTuningLM):
         if trainer.is_global_zero:
             loss = trainer.callback_metrics.get("train/loss")
             ppl = trainer.callback_metrics.get("train/ppl")
@@ -180,13 +215,13 @@ class PrintEpochSummary(L.Callback):
 
 
 # -------------------- DataModule --------------------
-class VLDataModule(L.LightningDataModule):
+class VLInstructDataModule(L.LightningDataModule):
     def __init__(
         self,
         dataset,
         processor: Processor,
         batch_size=16,
-        max_seq_len=1024,
+        max_seq_len=2048,
         num_workers=4,
     ):
         super().__init__()
@@ -195,7 +230,7 @@ class VLDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
         self.num_workers = num_workers
-        self.collate_fn = make_collate_fn(processor, max_seq_len=max_seq_len)
+        self.collate_fn = make_instruct_collate_fn(processor, max_seq_len=max_seq_len)
 
     def train_dataloader(self):
         return DataLoader(
@@ -218,24 +253,33 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--devices", type=int, default=8)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--grad_accum", type=int, default=1)
-    ap.add_argument("--max_seq_len", type=int, default=1024)
-    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--max_seq_len", type=int, default=2048)
+    ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--precision", type=str, default="bf16-mixed")
     ap.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
-    ap.add_argument("--proj_out", type=str, default="projection.safetensors")
+    ap.add_argument("--proj_out", type=str, default="instruct_projection.safetensors")
     ap.add_argument("--model_variant", type=str, default="8B")
     ap.add_argument("--vision_repo", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--text_repo", type=str, default="Qwen/Qwen3-8B")
-    ap.add_argument("--processor_repo", type=str, default="Qwen/Qwen3-8B")
+    ap.add_argument("--processor_repo", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--cache_dir", type=str, default="./cache")
+    ap.add_argument(
+        "--pretrained_proj",
+        type=str,
+        default=None,
+        help="Path to pretrained projection weights",
+    )
+    ap.add_argument(
+        "--freeze_llm", action="store_true", help="Only train projection layer"
+    )
     args = ap.parse_args()
 
-    # 1) Build model & processor on CPU (ensure your factory DOES NOT .to('cuda') internally)
+    # 1) Build model & processor on CPU
     model = Qwen3V.from_pretrained_components(
         model_variant=args.model_variant,
         vision_model_repo=args.vision_repo,
@@ -245,12 +289,28 @@ def main():
         repo_id=args.processor_repo, vision_config=model.vision_config
     )
 
-    # 2) Data
-    dataset = LLaVAPretrainDataset(cache_dir=args.cache_dir)
+    # Load pretrained projection weights if provided
+    if args.pretrained_proj:
+        print(f"Loading pretrained projection from {args.pretrained_proj}")
+        from safetensors import safe_open
+
+        with safe_open(args.pretrained_proj, framework="pt", device="cpu") as f:
+            proj_state = {
+                k.replace("projection.", ""): f.get_tensor(k)
+                for k in f.keys()
+                if k.startswith("projection.")
+            }
+        model.projection.load_state_dict(proj_state)
+        print("✓ Pretrained projection weights loaded")
+
+    # 2) Data - use instruction dataset
+    dataset = LLaVAInstructDataset(cache_dir=args.cache_dir)
     steps_per_epoch = max(1, math.ceil(len(dataset) / args.batch_size))
     total_steps = steps_per_epoch * args.epochs
-    warmup_steps = max(100, int(0.02 * total_steps))
-    dm = VLDataModule(
+    warmup_steps = max(
+        100, int(0.1 * total_steps)
+    )  # More warmup for instruction tuning
+    dm = VLInstructDataModule(
         dataset=dataset,
         processor=processor,
         batch_size=args.batch_size,
@@ -258,13 +318,12 @@ def main():
         num_workers=args.num_workers,
     )
 
-    # 3) Figure out the Transformer block class (for wrapping/checkpointing)
-    #    Assumes your blocks live at model.model.layers
+    # 3) Figure out the Transformer block class
     Block = type(model.model.model.layers[0])
 
     # 4) Lightning module
     use_act_ckpt = args.strategy == "fsdp"
-    lit = ProjectionOnlyLM(
+    lit = InstructionTuningLM(
         model=model,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -273,11 +332,11 @@ def main():
         log_every=10,
         use_act_ckpt=use_act_ckpt,
         block_cls=Block,
+        freeze_llm=args.freeze_llm,
     )
 
     # 5) Strategy
     if args.strategy == "fsdp":
-        auto_wrap = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
         strategy = FSDPStrategy(
             auto_wrap_policy=partial(
                 transformer_auto_wrap_policy, transformer_layer_cls={Block}
@@ -287,7 +346,6 @@ def main():
             limit_all_gathers=True,
             activation_checkpointing_policy={Block},
         )
-
     else:
         strategy = "ddp"
 
@@ -308,23 +366,47 @@ def main():
 
 
 """
-PYTHONPATH=. python train/s2_qwen3v.py \
-    --devices 2 \
-    --batch_size 16 \
+# To instruction tune 4B model (projection only)
+PYTHONPATH=. python train/s2_qwen3v_instruct.py \
+    --devices 8 \
+    --batch_size 8 \
     --epochs 1 \
-    --grad_accum 1 \
-    --max_seq_len 1024 \
-    --lr 2e-3 \
+    --grad_accum 2 \
+    --max_seq_len 2048 \
+    --lr 1e-5 \
     --weight_decay 0.01 \
     --num_workers 4 \
     --precision bf16-mixed \
     --strategy ddp \
-    --proj_out projection.safetensors \
+    --proj_out instruct-projection-4b.safetensors \
     --model_variant 4B \
     --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
     --text_repo Qwen/Qwen3-4B-Instruct-2507 \
     --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --cache_dir ./cache
+    --cache_dir ./cache \
+    --pretrained_proj projection-4b.safetensors \
+    --freeze_llm
+
+# To instruction tune 8B model (projection only)
+PYTHONPATH=. python train/s2_qwen3v_instruct.py \
+    --devices 8 \
+    --batch_size 4 \
+    --epochs 1 \
+    --grad_accum 4 \
+    --max_seq_len 2048 \
+    --lr 1e-5 \
+    --weight_decay 0.01 \
+    --num_workers 4 \
+    --precision bf16-mixed \
+    --strategy fsdp \
+    --proj_out instruct-projection-8b.safetensors \
+    --model_variant 8B \
+    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --text_repo Qwen/Qwen3-8B \
+    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --cache_dir ./cache \
+    --pretrained_proj projection-8b.safetensors \
+    --freeze_llm
 """
 
 if __name__ == "__main__":
