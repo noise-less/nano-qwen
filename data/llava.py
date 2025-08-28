@@ -30,7 +30,7 @@ def setup_cache(base_url, jsonl_filename, images_filename, cache_dir="./cache"):
     return jsonl_path, images_dir
 
 
-def _transform_message_content(content, image_filename):
+def _transform_message_content(content, image_obj):
     """Transform message content from string with <image> tokens to list format."""
     if "<image>" not in content:
         return [{"type": "text", "content": content}]
@@ -44,7 +44,7 @@ def _transform_message_content(content, image_filename):
 
         # Add image part after each text part except the last
         if i < len(parts) - 1:
-            result.append({"type": "image", "content": image_filename})
+            result.append({"type": "image", "content": image_obj})
 
     return result
 
@@ -97,12 +97,15 @@ class LLaVAPretrainDataset(Dataset):
         item = self.data[idx]
         image_path = os.path.join(self.images_dir, item["image"])
         image = Image.open(image_path)
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
 
         # Transform messages to list format
         transformed_messages = []
         for message in item["messages"]:
             transformed_content = _transform_message_content(
-                message["content"], image_path
+                message["content"], image
             )
             transformed_messages.append(
                 {"role": message["role"], "content": transformed_content}
@@ -128,12 +131,15 @@ class LLaVAInstructDataset(Dataset):
         item = self.data[idx]
         image_path = os.path.join(self.images_dir, item["image"])
         image = Image.open(image_path)
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
 
         # Transform messages to list format
         transformed_messages = []
         for message in item["messages"]:
             transformed_content = _transform_message_content(
-                message["content"], image_path
+                message["content"], image
             )
             transformed_messages.append(
                 {"role": message["role"], "content": transformed_content}

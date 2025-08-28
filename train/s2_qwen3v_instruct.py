@@ -7,6 +7,8 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from safetensors.torch import save_file
+import urllib.request
+from pathlib import Path
 
 # FSDP plumbing
 from functools import partial
@@ -21,6 +23,26 @@ from data.llava import LLaVAInstructDataset
 
 
 # -------------------- utils --------------------
+def download_file(url: str, local_path: str) -> str:
+    """Download a file from URL if it doesn't exist locally"""
+    local_path = Path(local_path)
+    
+    if local_path.exists():
+        print(f"File already exists: {local_path}")
+        return str(local_path)
+    
+    print(f"Downloading {url} to {local_path}")
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        urllib.request.urlretrieve(url, local_path)
+        print(f"✓ Downloaded to {local_path}")
+        return str(local_path)
+    except Exception as e:
+        print(f"Error downloading {url}: {e}")
+        raise
+
+
 def freeze_except_projection(model):
     for p in model.parameters():
         p.requires_grad = False
@@ -272,7 +294,7 @@ def main():
         "--pretrained_proj",
         type=str,
         default=None,
-        help="Path to pretrained projection weights",
+        help="Path or URL to pretrained projection weights",
     )
     ap.add_argument(
         "--freeze_llm", action="store_true", help="Only train projection layer"
@@ -293,8 +315,16 @@ def main():
     if args.pretrained_proj:
         print(f"Loading pretrained projection from {args.pretrained_proj}")
         from safetensors import safe_open
+        
+        # Handle URL downloads
+        proj_path = args.pretrained_proj
+        if proj_path.startswith(("http://", "https://")):
+            # Extract filename from URL
+            filename = proj_path.split("/")[-1]
+            local_path = os.path.join(args.cache_dir, filename)
+            proj_path = download_file(proj_path, local_path)
 
-        with safe_open(args.pretrained_proj, framework="pt", device="cpu") as f:
+        with safe_open(proj_path, framework="pt", device="cpu") as f:
             proj_state = {
                 k.replace("projection.", ""): f.get_tensor(k)
                 for k in f.keys()
@@ -368,11 +398,11 @@ def main():
 """
 # To instruction tune 4B model (projection only)
 PYTHONPATH=. python train/s2_qwen3v_instruct.py \
-    --devices 8 \
-    --batch_size 8 \
-    --epochs 1 \
+    --devices 1 \
+    --batch_size 1 \
+    --epochs 3 \
     --grad_accum 2 \
-    --max_seq_len 2048 \
+    --max_seq_len 1024 \
     --lr 1e-5 \
     --weight_decay 0.01 \
     --num_workers 4 \
@@ -384,7 +414,7 @@ PYTHONPATH=. python train/s2_qwen3v_instruct.py \
     --text_repo Qwen/Qwen3-4B-Instruct-2507 \
     --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
     --cache_dir ./cache \
-    --pretrained_proj projection-4b.safetensors \
+    --pretrained_proj https://huggingface.co/iiTzEddy/Qwen3V-4B-pretrained/resolve/main/projection-4b.safetensors \
     --freeze_llm
 
 # To instruction tune 8B model (projection only)
