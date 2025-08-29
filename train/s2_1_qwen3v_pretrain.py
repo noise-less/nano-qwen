@@ -309,7 +309,7 @@ def main():
 
 """
 # To pretrain 4B model
-PYTHONPATH=. python train/s2_qwen3v_pretrain.py \
+PYTHONPATH=. python train/s2_1_qwen3v_pretrain.py \
     --devices 1 \
     --batch_size 8 \
     --epochs 1 \
@@ -328,7 +328,7 @@ PYTHONPATH=. python train/s2_qwen3v_pretrain.py \
     --cache_dir ./cache
 
 # To pretrain 8B model
-PYTHONPATH=. python train/s2_qwen3v_pretrain.py \
+PYTHONPATH=. python train/s2_1_qwen3v_pretrain.py \
     --devices 8 \
     --batch_size 8 \
     --epochs 1 \

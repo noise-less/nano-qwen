@@ -397,7 +397,7 @@ def main():
 
 """
 # To instruction tune 4B model (projection only)
-PYTHONPATH=. python train/s2_qwen3v_instruct.py \
+PYTHONPATH=. python train/s2_2_qwen3v_instruct.py \
     --devices 1 \
     --batch_size 2 \
     --epochs 3 \
@@ -418,7 +418,7 @@ PYTHONPATH=. python train/s2_qwen3v_instruct.py \
     --freeze_llm
 
 # To instruction tune 8B model (projection only)
-PYTHONPATH=. python train/s2_qwen3v_instruct.py \
+PYTHONPATH=. python train/s2_2_qwen3v_instruct.py \
     --devices 8 \
     --batch_size 4 \
     --epochs 1 \
