@@ -231,9 +231,9 @@ class Qwen2VL(nn.Module):
 
             # Concatenate all chunks for this example => shape [3, seq_len]
             pos_ids_example = torch.cat(pos_chunks, dim=1).to(device)
-            all_pos_ids = pos_ids_example.unsqueeze(1).expand(-1, B, -1)
+            all_pos_ids[batch_idx] = pos_ids_example
 
-        return all_pos_ids
+        return all_pos_ids.transpose(0, 1)
 
     def forward(
         self,
