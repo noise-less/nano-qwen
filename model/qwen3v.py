@@ -137,38 +137,41 @@ class Qwen3V(nn.Module):
         device = input_ids.device
         all_pos_ids = torch.zeros(B, 3, T, dtype=torch.long, device=device)
 
+        image_idx_global = 0  # Global image index across all batch items
+        
         for batch_idx in range(B):
             seq = input_ids[batch_idx]
             seq_idx = 0
-            image_idx = 0
             pos_chunks = []
             position_id = 0
 
             while seq_idx < T:
                 token_id = seq[seq_idx].item()
                 if token_id == self.image_pad_token_id:
-                    t, h, w = d_image[image_idx]
+                    t, h, w = d_image[image_idx_global]
                     h = h // self.vision_config.spatial_merge_size
                     w = w // self.vision_config.spatial_merge_size
 
-                    t_idx = torch.arange(t).view(t, 1).expand(t, h * w).flatten()
-                    h_idx = torch.arange(h).view(1, h, 1).expand(t, h, w).flatten()
-                    w_idx = torch.arange(w).view(1, 1, w).expand(t, h, w).flatten()
+                    t_idx = torch.arange(t, device=device).view(t, 1).expand(t, h * w).flatten()
+                    h_idx = torch.arange(h, device=device).view(1, h, 1).expand(t, h, w).flatten()
+                    w_idx = torch.arange(w, device=device).view(1, 1, w).expand(t, h, w).flatten()
 
                     pos_vision = torch.stack([t_idx, h_idx, w_idx]) + position_id
                     pos_chunks.append(pos_vision)
                     position_id = pos_vision.max().item() + 1
                     seq_idx += t * h * w
-                    image_idx += 1
+                    image_idx_global += 1
                 else:
-                    pos_text = torch.tensor([position_id])
+                    pos_text = torch.tensor([position_id], device=device)
                     pos_text = pos_text.unsqueeze(0).expand(3, 1)
                     pos_chunks.append(pos_text)
                     position_id += 1
                     seq_idx += 1
 
             pos_ids_example = torch.cat(pos_chunks, dim=1).to(device)
-            all_pos_ids[batch_idx] = pos_ids_example
+            # Ensure we only assign up to the actual sequence length
+            actual_seq_len = min(pos_ids_example.shape[1], T)
+            all_pos_ids[batch_idx, :, :actual_seq_len] = pos_ids_example[:, :actual_seq_len]
 
         return all_pos_ids.transpose(0, 1)
 

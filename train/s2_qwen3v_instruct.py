@@ -399,12 +399,12 @@ def main():
 # To instruction tune 4B model (projection only)
 PYTHONPATH=. python train/s2_qwen3v_instruct.py \
     --devices 1 \
-    --batch_size 1 \
+    --batch_size 2 \
     --epochs 3 \
-    --grad_accum 2 \
+    --grad_accum 8 \
     --max_seq_len 1024 \
-    --lr 1e-5 \
-    --weight_decay 0.01 \
+    --lr 5e-4 \
+    --weight_decay 0 \
     --num_workers 4 \
     --precision bf16-mixed \
     --strategy ddp \

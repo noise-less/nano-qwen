@@ -310,13 +310,13 @@ def main():
 """
 # To pretrain 4B model
 PYTHONPATH=. python train/s2_qwen3v_pretrain.py \
-    --devices 8 \
-    --batch_size 16 \
+    --devices 1 \
+    --batch_size 8 \
     --epochs 1 \
-    --grad_accum 1 \
+    --grad_accum 2 \
     --max_seq_len 1024 \
     --lr 2e-3 \
-    --weight_decay 0.01 \
+    --weight_decay 0 \
     --num_workers 4 \
     --precision bf16-mixed \
     --strategy ddp \
