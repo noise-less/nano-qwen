@@ -26,14 +26,14 @@ from data.llava import LLaVAInstructDataset
 def download_file(url: str, local_path: str) -> str:
     """Download a file from URL if it doesn't exist locally"""
     local_path = Path(local_path)
-    
+
     if local_path.exists():
         print(f"File already exists: {local_path}")
         return str(local_path)
-    
+
     print(f"Downloading {url} to {local_path}")
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     try:
         urllib.request.urlretrieve(url, local_path)
         print(f"✓ Downloaded to {local_path}")
@@ -315,7 +315,7 @@ def main():
     if args.pretrained_proj:
         print(f"Loading pretrained projection from {args.pretrained_proj}")
         from safetensors import safe_open
-        
+
         # Handle URL downloads
         proj_path = args.pretrained_proj
         if proj_path.startswith(("http://", "https://")):
@@ -394,50 +394,6 @@ def main():
 
     trainer.fit(lit, datamodule=dm)
 
-
-"""
-# To instruction tune 4B model (projection only)
-PYTHONPATH=. python train/s2_2_qwen3v_instruct.py \
-    --devices 1 \
-    --batch_size 2 \
-    --epochs 3 \
-    --grad_accum 8 \
-    --max_seq_len 1024 \
-    --lr 5e-4 \
-    --weight_decay 0 \
-    --num_workers 4 \
-    --precision bf16-mixed \
-    --strategy ddp \
-    --proj_out instruct-projection-4b.safetensors \
-    --model_variant 4B \
-    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --text_repo Qwen/Qwen3-4B-Instruct-2507 \
-    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --cache_dir ./cache \
-    --pretrained_proj https://huggingface.co/iiTzEddy/Qwen3V-4B-pretrained/resolve/main/projection-4b.safetensors \
-    --freeze_llm
-
-# To instruction tune 8B model (projection only)
-PYTHONPATH=. python train/s2_2_qwen3v_instruct.py \
-    --devices 8 \
-    --batch_size 4 \
-    --epochs 1 \
-    --grad_accum 4 \
-    --max_seq_len 2048 \
-    --lr 1e-5 \
-    --weight_decay 0.01 \
-    --num_workers 4 \
-    --precision bf16-mixed \
-    --strategy fsdp \
-    --proj_out instruct-projection-8b.safetensors \
-    --model_variant 8B \
-    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --text_repo Qwen/Qwen3-8B \
-    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --cache_dir ./cache \
-    --pretrained_proj projection-8b.safetensors \
-    --freeze_llm
-"""
 
 if __name__ == "__main__":
     main()

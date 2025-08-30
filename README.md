@@ -78,6 +78,60 @@ for token_id in generator:
 print()
 ```
 
+## 🚀 Training Qwen3V-4B-Preview
+
+To reproduce the training of Qwen3V-4B-Preview's projection layer:
+
+**Step 1: Pretraining (LLaVA-595K dataset)**
+```bash
+PYTHONPATH=. python train/s2_1_qwen3v_pretrain.py \
+    --devices 8 \
+    --batch_size 8 \
+    --epochs 1 \
+    --grad_accum 2 \
+    --max_seq_len 1024 \
+    --lr 5e-4 \
+    --weight_decay 0 \
+    --num_workers 4 \
+    --precision bf16-mixed \
+    --strategy ddp \
+    --proj_out projection-4b.safetensors \
+    --model_variant 4B \
+    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --text_repo Qwen/Qwen3-4B-Instruct-2507 \
+    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --cache_dir ./cache
+```
+
+**Step 2: Instruction Tuning (LLaVA-150K dataset)**
+```bash
+PYTHONPATH=. python train/s2_2_qwen3v_instruct.py \
+    --devices 8 \
+    --batch_size 2 \
+    --epochs 3 \
+    --grad_accum 8 \
+    --max_seq_len 1024 \
+    --lr 5e-4 \
+    --weight_decay 0 \
+    --num_workers 4 \
+    --precision bf16-mixed \
+    --strategy ddp \
+    --proj_out instruct-projection-4b.safetensors \
+    --model_variant 4B \
+    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --text_repo Qwen/Qwen3-4B-Instruct-2507 \
+    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --cache_dir ./cache \
+    --pretrained_proj projection-4b.safetensors \
+    --freeze_llm
+```
+
+**Training Notes:**
+- Uses 8x H100 GPUs (can be adjusted with `--devices`)
+- Only trains the projection layer (`--freeze_llm`)
+- Effective batch size: 128 (pretraining), 128 (instruction tuning)
+- Total training time: ~1 epoch pretraining + 3 epochs instruction tuning
+
 **Running `Qwen3`:**
 
 ```python

@@ -307,45 +307,5 @@ def main():
     trainer.fit(lit, datamodule=dm)
 
 
-"""
-# To pretrain 4B model
-PYTHONPATH=. python train/s2_1_qwen3v_pretrain.py \
-    --devices 1 \
-    --batch_size 8 \
-    --epochs 1 \
-    --grad_accum 2 \
-    --max_seq_len 1024 \
-    --lr 2e-3 \
-    --weight_decay 0 \
-    --num_workers 4 \
-    --precision bf16-mixed \
-    --strategy ddp \
-    --proj_out projection-4b.safetensors \
-    --model_variant 4B \
-    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --text_repo Qwen/Qwen3-4B-Instruct-2507 \
-    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --cache_dir ./cache
-
-# To pretrain 8B model
-PYTHONPATH=. python train/s2_1_qwen3v_pretrain.py \
-    --devices 8 \
-    --batch_size 8 \
-    --epochs 1 \
-    --grad_accum 1 \
-    --max_seq_len 1024 \
-    --lr 2e-3 \
-    --weight_decay 0.01 \
-    --num_workers 4 \
-    --precision bf16-mixed \
-    --strategy fsdp \
-    --proj_out projection-8b.safetensors \
-    --model_variant 8B \
-    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --text_repo Qwen/Qwen3-8B \
-    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --cache_dir ./cache
-"""
-
 if __name__ == "__main__":
     main()
