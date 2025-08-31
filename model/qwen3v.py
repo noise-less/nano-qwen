@@ -17,7 +17,8 @@ class Qwen3V(nn.Module):
             "4B",
             "8B",
             "14B",
-        ], "model_variant must be one of 1.7B, 4B, 8B, 14B"
+            "30B",
+        ], "model_variant must be one of 1.7B, 4B, 8B, 14B, 30B"
 
         if model_variant == "1.7B":
             self.lm_config = Qwen3Config(
@@ -95,6 +96,25 @@ class Qwen3V(nn.Module):
                 }
             )
             self.model = Qwen3Dense(self.lm_config)
+        elif model_variant == "30B":
+            self.lm_config = Qwen3Config(
+                **{
+                    "n_embed": 2048,
+                    "n_heads": 32,
+                    "n_kv_heads": 4,
+                    "n_layer": 48,
+                    "n_mlp": 6144,
+                    "rope_theta": 10000000,
+                    "rms_norm_eps": 1e-06,
+                    "vocab_size": 151936,
+                    "tie_word_embeddings": False,
+                    "head_dim": 128,
+                    "num_experts": 128,
+                    "num_experts_per_tok": 8,
+                    "moe_intermediate_size": 768,
+                }
+            )
+            self.model = Qwen3MoE(self.lm_config)
         else:
             raise ValueError(f"Invalid model variant: {model_variant}")
 

@@ -279,9 +279,7 @@ def main():
     if args.strategy == "fsdp":
         auto_wrap = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
         strategy = FSDPStrategy(
-            auto_wrap_policy=partial(
-                transformer_auto_wrap_policy, transformer_layer_cls={Block}
-            ),
+            auto_wrap_policy=auto_wrap,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             use_orig_params=True,
             limit_all_gathers=True,
