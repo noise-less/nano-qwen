@@ -302,7 +302,7 @@ def main():
 
                 response_tokens = []
                 for token in generate_local_response(
-                    current_messages,
+                    messages,
                     model,
                     processor,
                     selected_model_generation,
