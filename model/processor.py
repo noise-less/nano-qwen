@@ -128,12 +128,15 @@ class Processor:
                     elif isinstance(content, list):
                         for item in content:
                             if item["type"] == "text":
-                                result.append(item["content"])
+                                result.append(item.get("text") or item.get("content"))
                             elif item["type"] == "image":
+                                from PIL import Image
+                                image_path = item.get("image") or item.get("content")
+                                image = Image.open(image_path)
                                 result.extend(
                                     [
                                         "<|vision_start|>",
-                                        item["content"],
+                                        image,
                                         "<|vision_end|>",
                                     ]
                                 )

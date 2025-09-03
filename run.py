@@ -66,9 +66,7 @@ ALL_MODELS = {
         "Qwen2.5-VL-72B-Instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
     },
     "Qwen3V": {
-        "Qwen3V-4B-Preview-1": "Qwen3V-4B-Preview-1",
-        "Qwen3V-4B-Preview-2": "Qwen3V-4B-Preview-2", 
-        "Qwen3V-4B-Preview-3": "Qwen3V-4B-Preview-3",
+        "Qwen3V-4B-Preview": "Qwen3V-4B-Preview",
     },
 }
 
@@ -89,9 +87,7 @@ REPO_ID_TO_MODEL_CLASS = {
     "Qwen/Qwen3-4B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-30B-A3B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-235B-A22B-Thinking-2507": Qwen3MoE,
-    "Qwen3V-4B-Preview-1": Qwen3V,
-    "Qwen3V-4B-Preview-2": Qwen3V,
-    "Qwen3V-4B-Preview-3": Qwen3V,
+    "Qwen3V-4B-Preview": Qwen3V,
 }
 
 STYLE = Style(
@@ -124,7 +120,6 @@ def parse_user_input(text):
     last_end = 0
 
     for match in matches:
-        # Add text before image
         if match.start() > last_end:
             text_part = text[last_end : match.start()].strip()
             if text_part:
@@ -153,10 +148,8 @@ def generate_local_response(
     messages, model, processor, model_generation, max_tokens=2048, stream=False
 ):
     """Generate response using local model."""
-    # Use processor directly - it now handles both message formats
     inputs = processor(messages)
 
-    # Move inputs to same device as model
     device = next(model.parameters()).device
     inputs["input_ids"] = inputs["input_ids"].to(device)
     if inputs["pixels"] is not None:
@@ -164,14 +157,11 @@ def generate_local_response(
     if inputs["d_image"] is not None:
         inputs["d_image"] = inputs["d_image"].to(device)
 
-    # Default stop tokens for Qwen models
     stop_tokens = [151645, 151644, 151643]  # <|im_end|>, <|im_start|>, <|endoftext|>
 
-    # Generate
     with torch.no_grad():
         if model_generation == "Qwen2.5-VL" or model_generation == "Qwen3V":
             if inputs["pixels"] is not None:
-                # Vision model with images
                 generation = model.generate(
                     input_ids=inputs["input_ids"],
                     pixels=inputs["pixels"],
@@ -181,7 +171,6 @@ def generate_local_response(
                     stream=stream,
                 )
             else:
-                # Vision model, text-only
                 generation = model.generate(
                     input_ids=inputs["input_ids"],
                     pixels=None,
@@ -191,7 +180,6 @@ def generate_local_response(
                     stream=stream,
                 )
         else:
-            # Text-only model
             generation = model.generate(
                 input_ids=inputs["input_ids"],
                 max_new_tokens=max_tokens,
@@ -200,12 +188,10 @@ def generate_local_response(
             )
 
     if stream:
-        # Streaming: yield decoded tokens one by one
         for token_id in generation:
             token_text = processor.tokenizer.decode([token_id])
             yield token_text
     else:
-        # Non-streaming: decode full response
         input_length = inputs["input_ids"].shape[1]
         response_ids = generation[:, input_length:]
         response = processor.tokenizer.decode(response_ids[0].tolist())
@@ -262,7 +248,7 @@ def main():
         with console.status(f"[bold green]Loading {hf_repo_id}...", spinner="dots"):
             try:
                 model = model_class.from_pretrained(hf_repo_id)
-                
+
                 # Move model to GPU if available
                 if torch.cuda.is_available():
                     device = "cuda"
@@ -273,28 +259,13 @@ def main():
 
         # Create processor with vision config if it's a vision model
         if selected_model_generation == "Qwen2.5-VL":
-            from model.vision import VisionConfig
-
-            vision_config = VisionConfig(
-                n_embed=model.config.vision_config.n_embed,
-                n_layer=model.config.vision_config.n_layer,
-                n_heads=model.config.vision_config.n_heads,
-                output_n_embed=model.config.n_embed,
-                in_channels=model.config.vision_config.in_channels,
-                spatial_merge_size=model.config.vision_config.spatial_merge_size,
-                spatial_patch_size=model.config.vision_config.spatial_patch_size,
-                temporal_patch_size=model.config.vision_config.temporal_patch_size,
-                intermediate_size=getattr(
-                    model.config.vision_config, "intermediate_size", None
-                ),
-                hidden_act=getattr(
-                    model.config.vision_config, "hidden_act", "quick_gelu"
-                ),
+            processor = Processor(
+                repo_id=hf_repo_id, vision_config=model.config.vision_config
             )
-            processor = Processor(repo_id=hf_repo_id, vision_config=vision_config)
         elif selected_model_generation == "Qwen3V":
-            # Use the vision config from the Qwen3V model
-            processor = Processor(repo_id="Qwen/Qwen2.5-VL-7B-Instruct", vision_config=model.vision_config)
+            processor = Processor(
+                repo_id="Qwen/Qwen2.5-VL-7B-Instruct", vision_config=model.vision_config
+            )
         else:
             processor = Processor(repo_id=hf_repo_id)
 
@@ -305,10 +276,8 @@ def main():
         # Start the interactive chat loop
         messages = []
         while True:
-            # Get user input
             user_input = input("\nUSER: ").strip()
 
-            # Handle special commands
             if user_input == "/exit":
                 console.print("Goodbye!")
                 break
@@ -318,12 +287,10 @@ def main():
             elif not user_input:
                 continue
 
-            # Parse user input to messages format
             current_messages = parse_user_input(user_input)
             messages.extend(current_messages)
 
             try:
-                # Generate response using local model with streaming
                 print("ASSISTANT: ", end="", flush=True)
 
                 response_tokens = []
@@ -337,16 +304,13 @@ def main():
                     print(token, end="", flush=True)
                     response_tokens.append(token)
 
-                # Complete the response
                 print()  # New line after streaming
                 response = "".join(response_tokens).strip()
 
-                # Add assistant's response to conversation
                 messages.append({"role": "assistant", "content": response})
 
             except Exception as e:
                 console.print(f"Error generating response: {e}", style="red")
-                # Remove the failed user message
                 if messages and messages[-1]["role"] == "user":
                     messages.pop()
 
