@@ -85,13 +85,9 @@ class Qwen3V(nn.Module):
                     h = h // self.vision_config.spatial_merge_size
                     w = w // self.vision_config.spatial_merge_size
 
-                    t_idx = torch.arange(t, device=device)
-                    t_idx = t_idx.view(t, 1).expand(t, h * w).flatten()
+                    t_idx = torch.arange(t, device=device).view(t, 1).expand(t, h * w).flatten()
                     h_idx = torch.arange(h, device=device).view(1, h, 1).expand(t, h, w).flatten()
                     w_idx = torch.arange(w, device=device).view(1, 1, w).expand(t, h, w).flatten()
-
-                    h_idx = h_idx.view(1, h, 1).expand(t, h, w).flatten()
-                    w_idx = w_idx.view(1, 1, w).expand(t, h, w).flatten()
 
                     pos_vision = torch.stack([t_idx, h_idx, w_idx]) + position_id
                     pos_chunks.append(pos_vision)
@@ -166,9 +162,9 @@ class Qwen3V(nn.Module):
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     @classmethod
-    def from_pretrained(cls):
+    def from_pretrained(cls, _):
         model = cls()
-        model.load_projection_weights_from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        model.load_vision_weights_from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
         model.load_text_weights_from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
 
         with tempfile.NamedTemporaryFile(

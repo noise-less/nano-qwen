@@ -253,6 +253,13 @@ def main():
                 if torch.cuda.is_available():
                     device = "cuda"
                     model = model.to(device)
+                
+                # Compile model for faster inference
+                try:
+                    model = torch.compile(model)
+                except Exception as compile_error:
+                    console.print(f"Failed to compile model: {compile_error}", style="yellow")
+                    
             except Exception as e:
                 console.print(f"Failed to load model: {e}")
                 return
