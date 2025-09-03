@@ -59,13 +59,6 @@ class Qwen3V(nn.Module):
         # frozen qwen3 text-only llm.
         self.model = Qwen3MoE(self.lm_config)
 
-        # frozen qwen3 model.
-        self.lm_head = None
-        if not self.lm_config.tie_word_embeddings:
-            self.lm_head = nn.Linear(
-                self.lm_config.n_embed, self.lm_config.vocab_size, bias=False
-            )
-
         # Constants for vision tokens
         self.image_pad_token_id = 151655
 
@@ -148,10 +141,8 @@ class Qwen3V(nn.Module):
         position_ids = self._get_position_ids(input_ids, d_image)
         x = self.model.model(x=input_embeds, position_ids=position_ids)
 
-        if self.lm_head is None:
-            logits = torch.matmul(x, self.model.model.embed_tokens.weight.T)
-        else:
-            logits = self.lm_head(x)
+        # Tie word embeddings so no lm_head is needed
+        logits = torch.matmul(x, self.model.model.embed_tokens.weight.T)
         return logits
 
     def load_vision_weights_from_pretrained(self, vision_model_repo: str):
@@ -170,10 +161,6 @@ class Qwen3V(nn.Module):
         text_model = Qwen3MoE.from_pretrained(text_model_repo)
 
         self.model.load_state_dict(text_model.state_dict(), strict=False)
-
-        if hasattr(text_model, "lm_head") and text_model.lm_head is not None:
-            if self.lm_head is not None:
-                self.lm_head.load_state_dict(text_model.lm_head.state_dict())
 
         del text_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
