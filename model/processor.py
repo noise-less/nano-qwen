@@ -17,15 +17,21 @@ class Processor:
             vision_start_token = "<|vision_start|>"
             vision_end_token = "<|vision_end|>"
             self.tokenizer.add_special_tokens([image_pad_token])
-            self.vision_start_token_id = self.tokenizer.encode(vision_start_token).ids[0]
+            self.vision_start_token_id = self.tokenizer.encode(vision_start_token).ids[
+                0
+            ]
             self.image_pad_token_id = self.tokenizer.encode(image_pad_token).ids[0]
             self.vision_end_token_id = self.tokenizer.encode(vision_end_token).ids[0]
 
             # Constants for image processing
             self.MIN_PIXELS = 3136
             self.MAX_PIXELS = 12845056
-            self.IMAGE_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-            self.IMAGE_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+            self.IMAGE_MEAN = np.array(
+                [0.48145466, 0.4578275, 0.40821073], dtype=np.float32
+            )
+            self.IMAGE_STD = np.array(
+                [0.26862954, 0.26130258, 0.27577711], dtype=np.float32
+            )
 
     def __call__(
         self,
@@ -46,14 +52,16 @@ class Processor:
         d_image_list = []
 
         # Identify if we have vision support
-        has_vision = (self.vision_config is not None)
+        has_vision = self.vision_config is not None
         if not has_vision:
             # If we have no vision_config, do text-only
             for item in inputs:
                 if isinstance(item, str):
                     input_ids.extend(self.tokenizer.encode(item).ids)
                 else:
-                    raise ValueError(f"Images are not supported by a text-only model. Got {type(item)}")
+                    raise ValueError(
+                        f"Images are not supported by a text-only model. Got {type(item)}"
+                    )
         else:
             # Vision + text model
             merge_size = self.vision_config.spatial_merge_size
@@ -100,9 +108,15 @@ class Processor:
             "d_image": d_image,
         }
 
-    def apply_chat_template(self, messages: List[dict]) -> List[Union[str, Image.Image]]:
+    def apply_chat_template(
+        self, messages: List[dict]
+    ) -> List[Union[str, Image.Image]]:
         # Simple implementation since tokenizer doesn't have apply_chat_template
-        if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
+        if (
+            isinstance(messages, list)
+            and len(messages) > 0
+            and isinstance(messages[0], dict)
+        ):
             # Standard messages format - convert to our mixed format
             result = []
             for message in messages:
@@ -114,13 +128,24 @@ class Processor:
                     elif isinstance(content, list):
                         for item in content:
                             if item["type"] == "text":
-                                result.append(item["text"])
+                                result.append(item.get("text") or item.get("content"))
                             elif item["type"] == "image":
-                                result.extend(["<|vision_start|>", Image.open(item["image"]), "<|vision_end|>"])
+                                from PIL import Image
+                                image_path = item.get("image") or item.get("content")
+                                image = Image.open(image_path)
+                                result.extend(
+                                    [
+                                        "<|vision_start|>",
+                                        image,
+                                        "<|vision_end|>",
+                                    ]
+                                )
                     result.append("<|im_end|>\n")
                 elif message["role"] == "assistant":
-                    result.append(f"<|im_start|>assistant\n{message['content']}<|im_end|>\n")
-            
+                    result.append(
+                        f"<|im_start|>assistant\n{message['content']}<|im_end|>\n"
+                    )
+
             # Add generation prompt
             result.append("<|im_start|>assistant\n")
             return result
@@ -169,7 +194,9 @@ class Processor:
             width,
             factor=SPATIAL_PATCH_SIZE * SPATIAL_MERGE_SIZE,
         )
-        image_resized = image.resize((resized_width, resized_height), resample=Image.BICUBIC)
+        image_resized = image.resize(
+            (resized_width, resized_height), resample=Image.BICUBIC
+        )
         image_np_resized = np.array(image_resized, dtype=np.float32)
 
         # Normalize
@@ -229,9 +256,7 @@ if __name__ == "__main__":
         spatial_patch_size=14,
         temporal_patch_size=2,
     )
-    our_processor = Processor(
-        repo_id=model_name, vision_config=vision_config
-    )
+    our_processor = Processor(repo_id=model_name, vision_config=vision_config)
 
     image_1 = Image.open("test-images/test-image.webp")
     image_2 = Image.open("test-images/test-image.jpeg")

@@ -160,6 +160,9 @@ def load_pretrained_model(
                 "VisionRotaryEmbedding",
             ],
         )
+    elif model_cls.__name__ == "Qwen3V":
+        # Qwen3V has custom loading logic, don't use accelerate
+        return model_cls.from_pretrained(repo_id)
     elif model_cls.__name__ == "Qwen3MoE":
         # MoE models - use init_empty_weights but with special handling
         with init_empty_weights():

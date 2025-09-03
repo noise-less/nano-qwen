@@ -1,0 +1,222 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
+from model.vision import VisionConfig, Qwen2VLVisionEncoder
+from model.qwen2_5_vl import Qwen2VL
+from model.qwen3 import Qwen3Config, Qwen3MoE
+
+import urllib.request
+from safetensors import safe_open
+import tempfile
+
+PROJECTION_CHECKPOINT_URL = "https://huggingface.co/iiTzEddy/Qwen3V-4B-Preview/resolve/main/projection-4b-instruct-ckpt-3.safetensors"
+
+
+class Qwen3V(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.lm_config = Qwen3Config(
+            n_embed=2560,
+            n_heads=32,
+            n_kv_heads=8,
+            n_layer=36,
+            n_mlp=9728,
+            rope_theta=5000000,
+            rms_norm_eps=1e-06,
+            vocab_size=151936,
+            tie_word_embeddings=True,
+            head_dim=128,
+            num_experts=None,
+            num_experts_per_tok=None,
+            moe_intermediate_size=None,
+        )
+
+        self.vision_config = VisionConfig(
+            n_embed=1280,
+            n_layer=32,
+            n_heads=16,
+            output_n_embed=3584,
+            in_channels=3,
+            spatial_merge_size=2,
+            spatial_patch_size=14,
+            temporal_patch_size=2,
+            intermediate_size=3420,
+            hidden_act="silu",
+        )
+
+        # frozen vision encoder taken from qwen2.5-vl.
+        self.visual = Qwen2VLVisionEncoder(self.vision_config)
+
+        # the only trainable part of this model.
+        self.projection = nn.Linear(
+            self.vision_config.output_n_embed, self.lm_config.n_embed
+        )
+
+        # frozen qwen3 text-only llm.
+        self.model = Qwen3MoE(self.lm_config)
+
+        # Constants for vision tokens
+        self.image_pad_token_id = 151655
+
+    # fmt: off
+    def _get_position_ids(
+        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        B, T = input_ids.shape
+        device = input_ids.device
+        all_pos_ids = torch.zeros(B, 3, T, dtype=torch.long, device=device)
+
+        image_idx_global = 0  # Global image index across all batch items
+
+        for batch_idx in range(B):
+            seq = input_ids[batch_idx]
+            seq_idx = 0
+            pos_chunks = []
+            position_id = 0
+
+            while seq_idx < T:
+                token_id = seq[seq_idx].item()
+                if token_id == self.image_pad_token_id:
+                    t, h, w = d_image[image_idx_global]
+                    h = h // self.vision_config.spatial_merge_size
+                    w = w // self.vision_config.spatial_merge_size
+
+                    t_idx = torch.arange(t, device=device).view(t, 1).expand(t, h * w).flatten()
+                    h_idx = torch.arange(h, device=device).view(1, h, 1).expand(t, h, w).flatten()
+                    w_idx = torch.arange(w, device=device).view(1, 1, w).expand(t, h, w).flatten()
+
+                    pos_vision = torch.stack([t_idx, h_idx, w_idx]) + position_id
+                    pos_chunks.append(pos_vision)
+                    position_id = pos_vision.max().item() + 1
+                    seq_idx += t * h * w
+                    image_idx_global += 1
+                else:
+                    pos_text = torch.tensor([position_id], device=device)
+                    pos_text = pos_text.unsqueeze(0).expand(3, 1)
+                    pos_chunks.append(pos_text)
+                    position_id += 1
+                    seq_idx += 1
+
+            pos_ids_example = torch.cat(pos_chunks, dim=1).to(device)
+            # Ensure we only assign up to the actual sequence length
+            actual_seq_len = min(pos_ids_example.shape[1], T)
+            all_pos_ids[batch_idx, :, :actual_seq_len] = pos_ids_example[
+                :, :actual_seq_len
+            ]
+
+        return all_pos_ids.transpose(0, 1)
+    # fmt: on
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        pixels: Optional[torch.Tensor] = None,
+        d_image: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input_embeds = self.model.model.embed_tokens(input_ids)
+
+        if pixels is not None:
+            # encode images through the vision encoder.
+            image_embeds = self.visual(pixels=pixels, d_image=d_image)
+            # Project vision embeddings to match text embedding dimension
+            image_embeds = self.projection(image_embeds)
+            # Ensure dtype compatibility
+            image_embeds = image_embeds.to(input_embeds.dtype)
+            # create a mask for the image tokens of shape (B, T)
+            image_mask = input_ids == self.image_pad_token_id
+            # expand the mask along embedding dimension to shape (B, T, C)
+            image_mask = image_mask.unsqueeze(-1).expand_as(input_embeds)
+            # replace image pad token embeddings with actual image embeddings
+            input_embeds = input_embeds.masked_scatter(image_mask, image_embeds)
+
+        # Use 3D position ids for multimodal support
+        position_ids = self._get_position_ids(input_ids, d_image)
+        x = self.model.model(x=input_embeds, position_ids=position_ids)
+
+        # Tie word embeddings so no lm_head is needed
+        logits = torch.matmul(x, self.model.model.embed_tokens.weight.T)
+        return logits
+
+    def load_vision_weights_from_pretrained(self, vision_model_repo: str):
+        vision_model = Qwen2VL.from_pretrained(vision_model_repo)
+
+        vision_state_dict = {}
+        for key, param in vision_model.visual.state_dict().items():
+            vision_state_dict[key] = param
+
+        self.visual.load_state_dict(vision_state_dict, strict=False)
+
+        del vision_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    def load_text_weights_from_pretrained(self, text_model_repo: str):
+        text_model = Qwen3MoE.from_pretrained(text_model_repo)
+
+        self.model.load_state_dict(text_model.state_dict(), strict=False)
+
+        del text_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    @classmethod
+    def from_pretrained(cls, _):
+        model = cls()
+        model.load_vision_weights_from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        model.load_text_weights_from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as tmp_file:
+            try:
+                urllib.request.urlretrieve(PROJECTION_CHECKPOINT_URL, tmp_file.name)
+
+                with safe_open(tmp_file.name, framework="pt", device="cpu") as f:
+                    proj_state = {
+                        k.replace("projection.", ""): f.get_tensor(k)
+                        for k in f.keys()
+                        if k.startswith("projection.")
+                    }
+
+                model.projection.load_state_dict(proj_state)
+
+            finally:
+                if os.path.exists(tmp_file.name):
+                    os.unlink(tmp_file.name)
+
+        return model
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        pixels: torch.Tensor,
+        d_image: torch.Tensor,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+        stream: bool = False,
+    ):
+        if stop_tokens is None:
+            stop_tokens = [
+                151645,
+                151644,
+                151643,
+            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
+        for _ in range(max_new_tokens):
+            logits = self.forward(input_ids=input_ids, pixels=pixels, d_image=d_image)
+            last_logits = logits[:, -1, :]
+            probs = F.softmax(last_logits, dim=-1)
+            next_token = probs.argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+            if stream:
+                yield next_token.item()
+
+            if next_token.item() in stop_tokens:
+                break
+
+        if not stream:
+            return input_ids
