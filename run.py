@@ -10,10 +10,13 @@ from rich.text import Text
 
 # Disable HuggingFace progress bars globally
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["HF_HUB_VERBOSITY"] = "error"
+os.environ["ACCELERATE_DISABLE_RICH"] = "1"
 
 from model.processor import Processor
 from model.qwen2_5_vl import Qwen2VL
 from model.qwen3 import Qwen3Dense, Qwen3MoE
+from model.qwen3v import Qwen3V
 
 ASCII_LOGO = """
 ██╗    ████████╗██╗███╗   ██╗██╗   ██╗    ██████╗ ██╗    ██╗███████╗███╗   ██╗
@@ -37,7 +40,7 @@ Available commands:
 /help - Show this help message
 /exit - Exit the application
 
-For Qwen2.5-VL, use @relative/path/to/image.jpg to include images in your messages.
+For Qwen2.5-VL and Qwen3V models, use @relative/path/to/image.jpg to include images in your messages.
 """
 
 # Mapping of all models: generation -> variant -> HF repo id
@@ -62,6 +65,11 @@ ALL_MODELS = {
         "Qwen2.5-VL-32B-Instruct": "Qwen/Qwen2.5-VL-32B-Instruct",
         "Qwen2.5-VL-72B-Instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
     },
+    "Qwen3V": {
+        "Qwen3V-4B-Preview-1": "Qwen3V-4B-Preview-1",
+        "Qwen3V-4B-Preview-2": "Qwen3V-4B-Preview-2", 
+        "Qwen3V-4B-Preview-3": "Qwen3V-4B-Preview-3",
+    },
 }
 
 REPO_ID_TO_MODEL_CLASS = {
@@ -81,6 +89,9 @@ REPO_ID_TO_MODEL_CLASS = {
     "Qwen/Qwen3-4B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-30B-A3B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-235B-A22B-Thinking-2507": Qwen3MoE,
+    "Qwen3V-4B-Preview-1": Qwen3V,
+    "Qwen3V-4B-Preview-2": Qwen3V,
+    "Qwen3V-4B-Preview-3": Qwen3V,
 }
 
 STYLE = Style(
@@ -158,7 +169,7 @@ def generate_local_response(
 
     # Generate
     with torch.no_grad():
-        if model_generation == "Qwen2.5-VL":
+        if model_generation == "Qwen2.5-VL" or model_generation == "Qwen3V":
             if inputs["pixels"] is not None:
                 # Vision model with images
                 generation = model.generate(
@@ -242,19 +253,23 @@ def main():
 
         hf_repo_id = ALL_MODELS[selected_model_generation][selected_model_variant]
 
-        console.print(f"\nLoading model: [bold]{hf_repo_id}[/bold]")
-
         model_class = REPO_ID_TO_MODEL_CLASS.get(hf_repo_id)
         if not model_class:
             console.print("Invalid model variant")
             return
 
-        try:
-            model = model_class.from_pretrained(hf_repo_id)
-            console.print("Model loaded successfully!")
-        except Exception as e:
-            console.print(f"Failed to load model: {e}")
-            return
+        # Show progress during model loading
+        with console.status(f"[bold green]Loading {hf_repo_id}...", spinner="dots"):
+            try:
+                model = model_class.from_pretrained(hf_repo_id)
+                
+                # Move model to GPU if available
+                if torch.cuda.is_available():
+                    device = "cuda"
+                    model = model.to(device)
+            except Exception as e:
+                console.print(f"Failed to load model: {e}")
+                return
 
         # Create processor with vision config if it's a vision model
         if selected_model_generation == "Qwen2.5-VL":
@@ -277,6 +292,9 @@ def main():
                 ),
             )
             processor = Processor(repo_id=hf_repo_id, vision_config=vision_config)
+        elif selected_model_generation == "Qwen3V":
+            # Use the vision config from the Qwen3V model
+            processor = Processor(repo_id="Qwen/Qwen2.5-VL-7B-Instruct", vision_config=model.vision_config)
         else:
             processor = Processor(repo_id=hf_repo_id)
 

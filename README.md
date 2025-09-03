@@ -94,12 +94,7 @@ PYTHONPATH=. python train/s2_1_qwen3v_pretrain.py \
     --weight_decay 0 \
     --num_workers 4 \
     --precision bf16-mixed \
-    --strategy ddp \
-    --proj_out projection-4b.safetensors \
-    --model_variant 4B \
-    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --text_repo Qwen/Qwen3-4B-Instruct-2507 \
-    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --proj_out projection-pretrained.safetensors \
     --cache_dir ./cache
 ```
 
@@ -115,14 +110,9 @@ PYTHONPATH=. python train/s2_2_qwen3v_instruct.py \
     --weight_decay 0 \
     --num_workers 4 \
     --precision bf16-mixed \
-    --strategy ddp \
-    --proj_out instruct-projection-4b.safetensors \
-    --model_variant 4B \
-    --vision_repo Qwen/Qwen2.5-VL-7B-Instruct \
-    --text_repo Qwen/Qwen3-4B-Instruct-2507 \
-    --processor_repo Qwen/Qwen2.5-VL-7B-Instruct \
+    --proj_out projection-instruct.safetensors \
     --cache_dir ./cache \
-    --pretrained_proj projection-4b.safetensors \
+    --pretrained_proj projection-pretrained.safetensors \
     --freeze_llm
 ```
 

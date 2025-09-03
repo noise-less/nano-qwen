@@ -1,20 +1,13 @@
-# lightning_qwen3v_projection.py
-import os, math, argparse
+import os
+import math
+import argparse
 import torch
 import torch.nn.functional as F
 import lightning as L
-from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from safetensors.torch import save_file
 
-# FSDP plumbing
-from functools import partial
-from lightning.pytorch.strategies import FSDPStrategy
-from torch.distributed.fsdp import ShardingStrategy
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-
-# your modules
 from model.processor import Processor
 from model.qwen3v import Qwen3V
 from data.llava import LLaVAPretrainDataset
@@ -228,19 +221,12 @@ def main():
     ap.add_argument("--precision", type=str, default="bf16-mixed")
     ap.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
     ap.add_argument("--proj_out", type=str, default="projection.safetensors")
-    ap.add_argument("--model_variant", type=str, default="8B")
-    ap.add_argument("--vision_repo", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
-    ap.add_argument("--text_repo", type=str, default="Qwen/Qwen3-8B")
     ap.add_argument("--processor_repo", type=str, default="Qwen/Qwen3-8B")
     ap.add_argument("--cache_dir", type=str, default="./cache")
     args = ap.parse_args()
 
     # 1) Build model & processor on CPU (ensure your factory DOES NOT .to('cuda') internally)
-    model = Qwen3V.from_pretrained_components(
-        model_variant=args.model_variant,
-        vision_model_repo=args.vision_repo,
-        text_model_repo=args.text_repo,
-    )
+    model = Qwen3V.from_pretrained()
     processor = Processor(
         repo_id=args.processor_repo, vision_config=model.vision_config
     )
@@ -258,12 +244,7 @@ def main():
         num_workers=args.num_workers,
     )
 
-    # 3) Figure out the Transformer block class (for wrapping/checkpointing)
-    #    Assumes your blocks live at model.model.layers
-    Block = type(model.model.model.layers[0])
-
-    # 4) Lightning module
-    use_act_ckpt = args.strategy == "fsdp"
+    # 3) Lightning module
     lit = ProjectionOnlyLM(
         model=model,
         lr=args.lr,
@@ -271,29 +252,14 @@ def main():
         total_steps=total_steps,
         warmup_steps=warmup_steps,
         log_every=10,
-        use_act_ckpt=use_act_ckpt,
-        block_cls=Block,
+        block_cls=type(model.model.model.layers[0]),
     )
 
-    # 5) Strategy
-    if args.strategy == "fsdp":
-        auto_wrap = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
-        strategy = FSDPStrategy(
-            auto_wrap_policy=auto_wrap,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            limit_all_gathers=True,
-            activation_checkpointing_policy={Block},
-        )
-
-    else:
-        strategy = "ddp"
-
-    # 6) Trainer
+    # 4) Trainer
     trainer = L.Trainer(
         accelerator="gpu",
         devices=args.devices,
-        strategy=strategy,
+        strategy="ddp",
         precision=args.precision,
         max_epochs=args.epochs,
         accumulate_grad_batches=args.grad_accum,

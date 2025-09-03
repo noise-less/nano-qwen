@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,118 +6,34 @@ from typing import Optional
 
 from model.vision import VisionConfig, Qwen2VLVisionEncoder
 from model.qwen2_5_vl import Qwen2VL
-from model.qwen3 import Qwen3Config, Qwen3MoE, Qwen3Dense
+from model.qwen3 import Qwen3Config, Qwen3MoE
+
+import urllib.request
+from safetensors import safe_open
+import tempfile
+
+PROJECTION_CHECKPOINT_URL = "https://huggingface.co/iiTzEddy/Qwen3V-4B-Preview/resolve/main/projection-4b-instruct-ckpt-3.safetensors"
 
 
 class Qwen3V(nn.Module):
-    def __init__(self, model_variant: str):
+    def __init__(self):
         super().__init__()
 
-        assert model_variant in [
-            "1.7B",
-            "4B",
-            "8B",
-            "14B",
-            "30B",
-        ], "model_variant must be one of 1.7B, 4B, 8B, 14B, 30B"
-
-        if model_variant == "1.7B":
-            self.lm_config = Qwen3Config(
-                **{
-                    "n_embed": 2048,
-                    "n_heads": 16,
-                    "n_kv_heads": 8,
-                    "n_layer": 28,
-                    "n_mlp": 6144,
-                    "rope_theta": 1000000,
-                    "rms_norm_eps": 1e-06,
-                    "vocab_size": 151936,
-                    "tie_word_embeddings": True,
-                    "head_dim": 128,
-                    "num_experts": None,
-                    "num_experts_per_tok": None,
-                    "moe_intermediate_size": None,
-                }
-            )
-            self.model = Qwen3Dense(self.lm_config)
-        elif model_variant == "4B":
-            self.lm_config = Qwen3Config(
-                **{
-                    "n_embed": 2560,
-                    "n_heads": 32,
-                    "n_kv_heads": 8,
-                    "n_layer": 36,
-                    "n_mlp": 9728,
-                    "rope_theta": 5000000,
-                    "rms_norm_eps": 1e-06,
-                    "vocab_size": 151936,
-                    "tie_word_embeddings": True,
-                    "head_dim": 128,
-                    "num_experts": None,
-                    "num_experts_per_tok": None,
-                    "moe_intermediate_size": None,
-                }
-            )
-            self.model = Qwen3MoE(self.lm_config)
-        elif model_variant == "8B":
-            self.lm_config = Qwen3Config(
-                **{
-                    "n_embed": 4096,
-                    "n_heads": 32,
-                    "n_kv_heads": 8,
-                    "n_layer": 36,
-                    "n_mlp": 12288,
-                    "rope_theta": 1000000,
-                    "rms_norm_eps": 1e-06,
-                    "vocab_size": 151936,
-                    "tie_word_embeddings": False,
-                    "head_dim": 128,
-                    "num_experts": None,
-                    "num_experts_per_tok": None,
-                    "moe_intermediate_size": None,
-                }
-            )
-            self.model = Qwen3Dense(self.lm_config)
-        elif model_variant == "14B":
-            self.lm_config = Qwen3Config(
-                **{
-                    "n_embed": 5120,
-                    "n_heads": 40,
-                    "n_kv_heads": 8,
-                    "n_layer": 40,
-                    "n_mlp": 17408,
-                    "rope_theta": 1000000,
-                    "rms_norm_eps": 1e-06,
-                    "vocab_size": 151936,
-                    "tie_word_embeddings": False,
-                    "head_dim": 128,
-                    "num_experts": None,
-                    "num_experts_per_tok": None,
-                    "moe_intermediate_size": None,
-                }
-            )
-            self.model = Qwen3Dense(self.lm_config)
-        elif model_variant == "30B":
-            self.lm_config = Qwen3Config(
-                **{
-                    "n_embed": 2048,
-                    "n_heads": 32,
-                    "n_kv_heads": 4,
-                    "n_layer": 48,
-                    "n_mlp": 6144,
-                    "rope_theta": 10000000,
-                    "rms_norm_eps": 1e-06,
-                    "vocab_size": 151936,
-                    "tie_word_embeddings": False,
-                    "head_dim": 128,
-                    "num_experts": 128,
-                    "num_experts_per_tok": 8,
-                    "moe_intermediate_size": 768,
-                }
-            )
-            self.model = Qwen3MoE(self.lm_config)
-        else:
-            raise ValueError(f"Invalid model variant: {model_variant}")
+        self.lm_config = Qwen3Config(
+            n_embed=2560,
+            n_heads=32,
+            n_kv_heads=8,
+            n_layer=36,
+            n_mlp=9728,
+            rope_theta=5000000,
+            rms_norm_eps=1e-06,
+            vocab_size=151936,
+            tie_word_embeddings=True,
+            head_dim=128,
+            num_experts=None,
+            num_experts_per_tok=None,
+            moe_intermediate_size=None,
+        )
 
         self.vision_config = VisionConfig(
             n_embed=1280,
@@ -139,6 +56,9 @@ class Qwen3V(nn.Module):
             self.vision_config.output_n_embed, self.lm_config.n_embed
         )
 
+        # frozen qwen3 text-only llm.
+        self.model = Qwen3MoE(self.lm_config)
+
         # frozen qwen3 model.
         self.lm_head = None
         if not self.lm_config.tie_word_embeddings:
@@ -149,16 +69,16 @@ class Qwen3V(nn.Module):
         # Constants for vision tokens
         self.image_pad_token_id = 151655
 
+    # fmt: off
     def _get_position_ids(
         self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        # Copy directly from Qwen2VL._get_position_ids()
         B, T = input_ids.shape
         device = input_ids.device
         all_pos_ids = torch.zeros(B, 3, T, dtype=torch.long, device=device)
 
         image_idx_global = 0  # Global image index across all batch items
-        
+
         for batch_idx in range(B):
             seq = input_ids[batch_idx]
             seq_idx = 0
@@ -172,9 +92,13 @@ class Qwen3V(nn.Module):
                     h = h // self.vision_config.spatial_merge_size
                     w = w // self.vision_config.spatial_merge_size
 
-                    t_idx = torch.arange(t, device=device).view(t, 1).expand(t, h * w).flatten()
+                    t_idx = torch.arange(t, device=device)
+                    t_idx = t_idx.view(t, 1).expand(t, h * w).flatten()
                     h_idx = torch.arange(h, device=device).view(1, h, 1).expand(t, h, w).flatten()
                     w_idx = torch.arange(w, device=device).view(1, 1, w).expand(t, h, w).flatten()
+
+                    h_idx = h_idx.view(1, h, 1).expand(t, h, w).flatten()
+                    w_idx = w_idx.view(1, 1, w).expand(t, h, w).flatten()
 
                     pos_vision = torch.stack([t_idx, h_idx, w_idx]) + position_id
                     pos_chunks.append(pos_vision)
@@ -191,9 +115,12 @@ class Qwen3V(nn.Module):
             pos_ids_example = torch.cat(pos_chunks, dim=1).to(device)
             # Ensure we only assign up to the actual sequence length
             actual_seq_len = min(pos_ids_example.shape[1], T)
-            all_pos_ids[batch_idx, :, :actual_seq_len] = pos_ids_example[:, :actual_seq_len]
+            all_pos_ids[batch_idx, :, :actual_seq_len] = pos_ids_example[
+                :, :actual_seq_len
+            ]
 
         return all_pos_ids.transpose(0, 1)
+    # fmt: on
 
     def forward(
         self,
@@ -228,72 +155,54 @@ class Qwen3V(nn.Module):
         return logits
 
     def load_vision_weights_from_pretrained(self, vision_model_repo: str):
-        """Load vision encoder weights from a pretrained Qwen2.5-VL model."""
-
-        # Load the full vision model
-        print(f"Loading vision weights from {vision_model_repo}...")
         vision_model = Qwen2VL.from_pretrained(vision_model_repo)
 
-        # Extract vision encoder state dict
         vision_state_dict = {}
         for key, param in vision_model.visual.state_dict().items():
             vision_state_dict[key] = param
 
-        # Load into our vision encoder
-        missing_keys, unexpected_keys = self.visual.load_state_dict(
-            vision_state_dict, strict=False
-        )
+        self.visual.load_state_dict(vision_state_dict, strict=False)
 
-        if missing_keys:
-            print(f"Warning: Missing keys: {missing_keys}")
-        if unexpected_keys:
-            print(f"Warning: Unexpected keys: {unexpected_keys}")
-
-        print("✓ Vision encoder weights loaded")
-
-        # Clean up
         del vision_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     def load_text_weights_from_pretrained(self, text_model_repo: str):
-        """Load text model weights from a pretrained Qwen3 model."""
-
-        print(f"Loading text weights from {text_model_repo}...")
         text_model = Qwen3MoE.from_pretrained(text_model_repo)
 
-        # Load the text model weights
-        missing_keys, unexpected_keys = self.model.load_state_dict(
-            text_model.state_dict(), strict=False
-        )
+        self.model.load_state_dict(text_model.state_dict(), strict=False)
 
-        if missing_keys:
-            print(f"Warning: Missing keys in text model: {missing_keys}")
-        if unexpected_keys:
-            print(f"Warning: Unexpected keys in text model: {unexpected_keys}")
-
-        # Also load lm_head if present
         if hasattr(text_model, "lm_head") and text_model.lm_head is not None:
             if self.lm_head is not None:
                 self.lm_head.load_state_dict(text_model.lm_head.state_dict())
-                print("✓ LM head weights loaded")
 
-        print("✓ Text model weights loaded")
-
-        # Clean up
         del text_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     @classmethod
-    def from_pretrained_components(
-        cls,
-        model_variant: str,
-        vision_model_repo: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-        text_model_repo: str = "Qwen/Qwen3-8B",
-    ):
-        """Create Qwen3V and load weights from separate pretrained components."""
-        model = cls(model_variant)
-        model.load_vision_weights_from_pretrained(vision_model_repo)
-        model.load_text_weights_from_pretrained(text_model_repo)
+    def from_pretrained(cls):
+        model = cls()
+        model.load_projection_weights_from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        model.load_text_weights_from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as tmp_file:
+            try:
+                urllib.request.urlretrieve(PROJECTION_CHECKPOINT_URL, tmp_file.name)
+
+                with safe_open(tmp_file.name, framework="pt", device="cpu") as f:
+                    proj_state = {
+                        k.replace("projection.", ""): f.get_tensor(k)
+                        for k in f.keys()
+                        if k.startswith("projection.")
+                    }
+
+                model.projection.load_state_dict(proj_state)
+
+            finally:
+                if os.path.exists(tmp_file.name):
+                    os.unlink(tmp_file.name)
+
         return model
 
     @torch.no_grad()
@@ -320,14 +229,11 @@ class Qwen3V(nn.Module):
             next_token = probs.argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
 
-            # If streaming, yield the new token
             if stream:
                 yield next_token.item()
 
-            # Check if we hit a stop token
             if next_token.item() in stop_tokens:
                 break
 
-        # If not streaming, return the full input_ids
         if not stream:
             return input_ids
