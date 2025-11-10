@@ -8,22 +8,24 @@ from dataclasses import dataclass
 
 @dataclass
 class VisionConfig:
-    """Vision encoder configuration for Qwen2.5-VL"""
+    repo_id: str
     n_embed: int
     n_layer: int
     n_heads: int
-    
+
     output_n_embed: int  # same as n_embed of the downstream model/LLM
 
     in_channels: int
     spatial_merge_size: int
     spatial_patch_size: int
     temporal_patch_size: int
-    
-    # Optional fields for Qwen2.5-VL compatibility
+
+    num_position_embeddings: int = 2304  # Max position embeddings for MRoPE
+    initializer_range: float = 0.02,
     intermediate_size: int = None  # For gated MLP
     hidden_act: str = "quick_gelu"  # Activation function
 
+    deepstack_visual_indexes: list[int] = None
 
 class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
@@ -312,3 +314,26 @@ class Qwen2VLVisionEncoder(nn.Module):
             )
 
         return self.merger(hidden_states)
+
+
+# Configuration key mapping for loading HuggingFace pretrained vision models
+# Maps: HuggingFace config key -> tiny-qwen config key
+HF_TO_VISION_CONFIG = {
+    "hidden_size": "n_embed",
+    "depth": "n_layer",
+    "num_heads": "n_heads",
+    "out_hidden_size": "output_n_embed",
+    "in_chans": "in_channels",
+    "spatial_merge_size": "spatial_merge_size",
+    "patch_size": "spatial_patch_size",
+    "temporal_patch_size": "temporal_patch_size",
+    "num_position_embeddings": "num_position_embeddings",
+    "initializer_range": "initializer_range",
+    "intermediate_size": "intermediate_size",
+    "hidden_act": "hidden_act",
+    "deepstack_visual_indexes": "deepstack_visual_indexes",
+}
+
+# Weight key mapping for loading HuggingFace pretrained vision model weights
+# Maps: HuggingFace component name -> tiny-qwen component name
+HF_TO_VISION_WEIGHTS = {}

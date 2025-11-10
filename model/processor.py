@@ -11,15 +11,6 @@ from tokenizers import Tokenizer
 from .vision import VisionConfig
 
 
-@dataclass
-class ModelInputs:
-    input_ids: torch.Tensor  # (B, T)
-    attention_mask: torch.Tensor  # (B, T)
-    # ^ tell model which tokens to attend to. good for ignoring padding tokens in a batch padded to the same length.
-    pixel_values: torch.Tensor  # (B, C, H, W)
-    image_grid_thw: torch.Tensor  # (B, T, 3, H, W)
-
-
 USER_MESSAGE_TEMPLATE = "<|im_start|>user\n{content}<|im_end|>\n"
 ASSISTANT_MESSAGE_TEMPLATE = "<|im_start|>assistant\n{content}{tool_calls}<|im_end|>\n"
 TOOL_MESSAGE_TEMPLATE = (
@@ -64,7 +55,7 @@ class Processor:
             )
 
     # Turn openai harmony style messages into model input tensors.
-    def __call__(self, messages: List[dict]) -> ModelInputs:
+    def __call__(self, messages: List[dict]) -> dict:
         messages_str = self._render_messages(messages)
         # input_ids = self.tokenizer.encode(messages_str).ids
         # attention_mask = torch.ones_like(input_ids)

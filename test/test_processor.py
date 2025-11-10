@@ -2,63 +2,107 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from model.processor import Processor, VisionConfig
+from model.processor import Processor
+from model.model import ModelConfig
+from model.vision import VisionConfig
+
+model_repo_id = "Qwen/Qwen3-VL-8B-Instruct"
+
+model_config = ModelConfig(
+    repo_id=model_repo_id,
+    n_embed=4096,
+    n_heads=32,
+    n_kv_heads=8,
+    n_layer=32,
+    n_mlp=12288,
+    rope_theta=5000000,
+    rms_norm_eps=1e-06,
+    vocab_size=151936,
+    tie_word_embeddings=False,
+    head_dim=128,
+)
+
+vision_config = VisionConfig(
+    repo_id=model_repo_id,
+    n_layer=27,
+    n_embed=1152,
+    n_heads=16,
+    output_n_embed=1280,
+    in_channels=3,
+    intermediate_size=4608,
+    initializer_range=0.02,
+    spatial_patch_size=16,
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+    num_position_embeddings=2304,
+    deepstack_visual_indexes=[8, 16, 24],
+    hidden_act="gelu_pytorch_tanh",
+)
 
 
 def test_processor():
     """Test our processor against HuggingFace's reference implementation."""
-    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_name = "Qwen/Qwen3-VL-4B-Instruct"
 
-    # Initialize processors
-    hf_processor = AutoProcessor.from_pretrained(model_name)
-    vision_config = VisionConfig(
-        n_embed=1280,
-        n_layer=32,
-        n_heads=16,
-        output_n_embed=1280,
-        in_channels=3,
-        spatial_merge_size=2,
-        spatial_patch_size=14,
-        temporal_patch_size=2,
-    )
-    our_processor = Processor(repo_id=model_name, vision_config=vision_config)
-
-    # Load test images
-    image_1 = Image.open("data/test-img-1.jpg")
-    image_2 = Image.open("data/test-img-2.jpg")
-
-    # Prepare input for HF processor
-    text_for_hf = (
-        "<|im_start|>user\n"
-        "<|vision_start|><|image_pad|><|vision_end|>What's in image 1?\n"
-        "<|vision_start|><|image_pad|><|vision_end|>Now what's in image 2?<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-
-    # Prepare input for our processor
-    text_for_ours = [
-        "<|im_start|>user\n<|vision_start|>",
-        image_1,
-        "<|vision_end|>What's in image 1?\n<|vision_start|>",
-        image_2,
-        "<|vision_end|>Now what's in image 2?<|im_end|>\n<|im_start|>assistant\n",
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": Image.open("test/data/test-img-1.jpg")},
+                {"type": "text", "text": "What's in image 1?"},
+                {"type": "image", "image": Image.open("test/data/test-img-2.jpg")},
+                {"type": "text", "text": "Now what's in image 2?"},
+            ],
+        }
     ]
 
-    # Process with HF processor
-    hf_processed = hf_processor(
-        text=[text_for_hf],
-        images=[image_1, image_2],
+    # huggingface processor results (correct results)
+    hf_processor = AutoProcessor.from_pretrained(model_name)
+    hf_inputs = hf_processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
         return_tensors="pt",
     )
-    hf_input_ids = hf_processed["input_ids"]
-    hf_pixel_values = hf_processed["pixel_values"]
-    hf_grid_thw = hf_processed["image_grid_thw"]
+    hf_input_ids = hf_inputs.input_ids
+    hf_pixel_values = hf_inputs.pixel_values
+    hf_grid_thw = hf_inputs.image_grid_thw
 
-    # Process with our processor
-    our_processed = our_processor(text_for_ours)
-    our_input_ids = our_processed["input_ids"]
-    our_pixel_values = our_processed["pixels"]
-    our_grid_thw = our_processed["d_image"]
+    # our processor results
+    our_processor = Processor(repo_id=model_name)
+    our_inputs = our_processor(messages)
+    our_input_ids = our_inputs["input_ids"]
+    our_pixel_values = our_inputs["pixels"]
+    our_grid_thw = our_inputs["d_image"]
+
+    # # vision_config = VisionConfig(
+    # #     n_embed=1280,
+    # #     n_layer=32,
+    # #     n_heads=16,
+    # #     output_n_embed=1280,
+    # #     in_channels=3,
+    # #     spatial_merge_size=2,
+    # #     spatial_patch_size=14,
+    # #     temporal_patch_size=2,
+    # # )
+    # # our_processor = Processor(repo_id=model_name, vision_config=vision_config)
+
+    # # Process with HF processor
+    # hf_processed = hf_processor(
+    #     text=[text_for_hf],
+    #     images=[image_1, image_2],
+    #     return_tensors="pt",
+    # )
+    # hf_input_ids = hf_processed["input_ids"]
+    # hf_pixel_values = hf_processed["pixel_values"]
+    # hf_grid_thw = hf_processed["image_grid_thw"]
+
+    # # Process with our processor
+    # our_processed = our_processor(text_for_ours)
+    # our_input_ids = our_processed["input_ids"]
+    # our_pixel_values = our_processed["pixels"]
+    # our_grid_thw = our_processed["d_image"]
 
     # Assert shapes match
     assert (
@@ -127,7 +171,7 @@ def test_message_conversion():
         },
     ]
 
-    processor = Processor(repo_id="Qwen/Qwen3-VL-30B-A3B-Instruct")
+    processor = Processor(repo_id="Qwen/Qwen3-VL-4B-Instruct")
 
     correct_rendered_messages = """<|im_start|>user
 What's in the image?<|vision_start|><|image_pad|><|vision_end|><|im_end|>
@@ -150,7 +194,9 @@ It's 18.2 °C in Paris right now.<|im_end|>
 """
 
     rendered_messages = processor(messages)
-    assert rendered_messages == correct_rendered_messages, "Rendered messages do not match"
+    assert (
+        rendered_messages == correct_rendered_messages
+    ), "Rendered messages do not match"
     print("Test passed")
 
 

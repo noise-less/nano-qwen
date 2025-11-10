@@ -7,7 +7,8 @@ from dataclasses import dataclass
 
 
 @dataclass
-class Qwen3Config:
+class ModelConfig:
+    repo_id: str
     n_embed: int
     n_heads: int
     n_kv_heads: int
@@ -527,3 +528,28 @@ class Qwen3MoE(nn.Module):
         from .util import load_pretrained_model
 
         return load_pretrained_model(cls, repo_id, device_map=device_map)
+
+
+# Configuration key mapping for loading HuggingFace pretrained language models
+# Maps: HuggingFace config key -> tiny-qwen config key
+HF_TO_LM_CONFIG = {
+    "hidden_size": "n_embed",
+    "num_attention_heads": "n_heads",
+    "num_key_value_heads": "n_kv_heads",
+    "num_hidden_layers": "n_layer",
+    "intermediate_size": "n_mlp",
+    "rope_theta": "rope_theta",
+    "rms_norm_eps": "rms_norm_eps",
+    "vocab_size": "vocab_size",
+    "tie_word_embeddings": "tie_word_embeddings",
+    "head_dim": "head_dim",
+    # MoE parameters
+    "num_experts": "num_experts",
+    "num_experts_per_tok": "num_experts_per_tok",
+    "moe_intermediate_size": "moe_intermediate_size",
+}
+
+# Weight key mapping for loading HuggingFace pretrained language model weights
+# Maps: HuggingFace component name -> tiny-qwen component name
+HF_TO_LM_WEIGHTS = {}
+
