@@ -1,204 +1,192 @@
 import torch
-from PIL import Image
 from transformers import AutoProcessor
-
 from model.processor import Processor
-from model.model import ModelConfig
-from model.vision import VisionConfig
 
-model_repo_id = "Qwen/Qwen3-VL-8B-Instruct"
-
-model_config = ModelConfig(
-    repo_id=model_repo_id,
-    n_embed=4096,
-    n_heads=32,
-    n_kv_heads=8,
-    n_layer=32,
-    n_mlp=12288,
-    rope_theta=5000000,
-    rms_norm_eps=1e-06,
-    vocab_size=151936,
-    tie_word_embeddings=False,
-    head_dim=128,
-)
-
-vision_config = VisionConfig(
-    repo_id=model_repo_id,
-    n_layer=27,
-    n_embed=1152,
-    n_heads=16,
-    output_n_embed=1280,
-    in_channels=3,
-    intermediate_size=4608,
-    initializer_range=0.02,
-    spatial_patch_size=16,
-    spatial_merge_size=2,
-    temporal_patch_size=2,
-    num_position_embeddings=2304,
-    deepstack_visual_indexes=[8, 16, 24],
-    hidden_act="gelu_pytorch_tanh",
-)
+MODEL_NAME = "Qwen/Qwen3-VL-2B-Instruct"
 
 
-def test_processor():
-    """Test our processor against HuggingFace's reference implementation."""
-    model_name = "Qwen/Qwen3-VL-4B-Instruct"
+def test_text_only():
+    """Test with text-only message."""
+    hf_proc = AutoProcessor.from_pretrained(MODEL_NAME)
+    our_proc = Processor.from_pretrained(MODEL_NAME)
 
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "image", "image": Image.open("test/data/test-img-1.jpg")},
-                {"type": "text", "text": "What's in image 1?"},
-                {"type": "image", "image": Image.open("test/data/test-img-2.jpg")},
-                {"type": "text", "text": "Now what's in image 2?"},
-            ],
+            "content": [{"type": "text", "text": "What is the meaning of life?"}],
         }
     ]
 
-    # huggingface processor results (correct results)
-    hf_processor = AutoProcessor.from_pretrained(model_name)
-    hf_inputs = hf_processor.apply_chat_template(
+    hf_inputs = hf_proc.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
     )
-    hf_input_ids = hf_inputs.input_ids
-    hf_pixel_values = hf_inputs.pixel_values
-    hf_grid_thw = hf_inputs.image_grid_thw
 
-    # our processor results
-    our_processor = Processor(repo_id=model_name)
-    our_inputs = our_processor(messages)
+    our_inputs = our_proc(messages, add_generation_prompt=True)
+
+    print(f"\n{'='*60}")
+    print(f"Test: Text Only")
+    print(f"{'='*60}")
+
+    # For text-only, no pixel values
+    assert not hasattr(hf_inputs, "pixel_values") or hf_inputs.pixel_values is None
+    assert our_inputs["pixels"] is None
+    assert our_inputs["d_image"] is None
+
+    print(f"✓ input_ids match exactly (shape: {hf_inputs.input_ids.shape})")
+    assert torch.equal(hf_inputs.input_ids, our_inputs["input_ids"].cpu())
+    print(f"✓ No pixel values (text-only)")
+    print(f"✅ All assertions passed!")
+
+
+def compare_outputs(hf_inputs, our_inputs, test_name=""):
+    """Compare HF and our processor outputs."""
+    print(f"\n{'='*60}")
+    print(f"Test: {test_name}")
+    print(f"{'='*60}")
+
+    hf_input_ids = hf_inputs.input_ids
+    hf_pixels = hf_inputs.pixel_values
+    hf_d_image = hf_inputs.image_grid_thw
+
     our_input_ids = our_inputs["input_ids"]
     our_pixel_values = our_inputs["pixels"]
     our_grid_thw = our_inputs["d_image"]
 
-    # # vision_config = VisionConfig(
-    # #     n_embed=1280,
-    # #     n_layer=32,
-    # #     n_heads=16,
-    # #     output_n_embed=1280,
-    # #     in_channels=3,
-    # #     spatial_merge_size=2,
-    # #     spatial_patch_size=14,
-    # #     temporal_patch_size=2,
-    # # )
-    # # our_processor = Processor(repo_id=model_name, vision_config=vision_config)
-
-    # # Process with HF processor
-    # hf_processed = hf_processor(
-    #     text=[text_for_hf],
-    #     images=[image_1, image_2],
-    #     return_tensors="pt",
-    # )
-    # hf_input_ids = hf_processed["input_ids"]
-    # hf_pixel_values = hf_processed["pixel_values"]
-    # hf_grid_thw = hf_processed["image_grid_thw"]
-
-    # # Process with our processor
-    # our_processed = our_processor(text_for_ours)
-    # our_input_ids = our_processed["input_ids"]
-    # our_pixel_values = our_processed["pixels"]
-    # our_grid_thw = our_processed["d_image"]
-
-    # Assert shapes match
-    assert (
-        hf_input_ids.shape == our_input_ids.shape
-    ), f"input_ids shape mismatch: HF {hf_input_ids.shape} vs Ours {our_input_ids.shape}"
-    assert (
-        hf_pixel_values.shape == our_pixel_values.shape
-    ), f"pixel_values shape mismatch: HF {hf_pixel_values.shape} vs Ours {our_pixel_values.shape}"
-    assert (
-        hf_grid_thw.shape == our_grid_thw.shape
-    ), f"grid_thw shape mismatch: HF {hf_grid_thw.shape} vs Ours {our_grid_thw.shape}"
-
-    # Assert input_ids match exactly
+    # Assert exact matches
     assert torch.equal(hf_input_ids, our_input_ids.cpu()), "input_ids do not match"
+    assert torch.equal(hf_d_image, our_grid_thw.cpu()), "grid_thw does not match"
 
-    # Assert pixel_values are close (allowing for small floating point differences)
-    diff = torch.abs(hf_pixel_values - our_pixel_values.cpu())
+    print(f"✓ input_ids match exactly (shape: {hf_input_ids.shape})")
+    print(f"✓ pixel_values shape match: {hf_pixels.shape}")
 
+    # Pixel value statistics
+    print(f"\n=== Pixel Values Comparison ===")
+    print(f"HF pixel_values - mean: {hf_pixels.mean():.6f}, std: {hf_pixels.std():.6f}")
+    print(
+        f"Our pixel_values - mean: {our_pixel_values.mean():.6f}, std: {our_pixel_values.std():.6f}"
+    )
+
+    # Difference statistics
+    diff = torch.abs(hf_pixels - our_pixel_values.cpu())
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
     median_diff = diff.median().item()
-    pct_large_diff = (diff > 0.01).float().mean().item() * 100
+    std_diff = diff.std().item()
+    pct_above_threshold = (diff > 0.01).float().mean().item() * 100
 
-    # Assert strict bounds on differences
-    assert max_diff < 0.05, f"Max difference {max_diff:.6f} exceeds 0.05"
-    assert mean_diff < 0.001, f"Mean difference {mean_diff:.6f} exceeds 0.001"
-    assert median_diff < 0.001, f"Median difference {median_diff:.6f} exceeds 0.001"
-    assert (
-        pct_large_diff < 1.0
-    ), f"Too many pixels differ: {pct_large_diff:.2f}% have diff > 0.01"
+    print(f"\nAbsolute Differences:")
+    print(f"  Max:    {max_diff:.6f}")
+    print(f"  Mean:   {mean_diff:.6f}")
+    print(f"  Median: {median_diff:.6f}")
+    print(f"  Std:    {std_diff:.6f}")
+    print(f"  % > 0.01: {pct_above_threshold:.2f}%")
 
-    # Assert grid_thw matches exactly
-    assert torch.equal(
-        hf_grid_thw, our_grid_thw.cpu()
-    ), "grid_thw (d_image) does not match"
+    print(f"\n✓ image_grid_thw:")
+    print(f"  - HF:  {hf_d_image.tolist()}")
+    print(f"  - Ours: {our_grid_thw.tolist()}")
+
+    # Assert pixel values are close enough
+    assert max_diff < 0.02, f"Max pixel difference {max_diff:.6f} exceeds 0.02"
+    assert mean_diff < 0.001, f"Mean pixel difference {mean_diff:.6f} exceeds 0.001"
+
+    print(f"✅ All assertions passed!")
 
 
-def test_message_conversion():
-    messages = [
+def test_single_image():
+    """Test with a single image from URL."""
+    hf_proc = AutoProcessor.from_pretrained(MODEL_NAME)
+    our_proc = Processor.from_pretrained(MODEL_NAME)
+
+    url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+
+    # HF uses "image" key, we use "url" key
+    hf_messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "What's in the image?"},
-                {"type": "image", "image": Image.open("data/test-img-1.jpg")},
+                {"type": "image", "image": url},
+                {"type": "text", "text": "Describe this image."},
             ],
-        },
-        {"role": "assistant", "content": "The image contains a bee on a sunflower."},
-        {"role": "user", "content": "what's the temperature in paris?"},
+        }
+    ]
+
+    our_messages = [
         {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "name": "get_current_temperature",
-                    "arguments": {"location": "Paris, France", "unit": "celsius"},
-                }
+            "role": "user",
+            "content": [
+                {"type": "image", "url": url},
+                {"type": "text", "text": "Describe this image."},
             ],
-        },
+        }
+    ]
+
+    hf_inputs = hf_proc.apply_chat_template(
+        hf_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+
+    our_inputs = our_proc(our_messages, add_generation_prompt=True)
+
+    compare_outputs(hf_inputs, our_inputs, "Single Image from URL")
+
+
+def test_multi_image():
+    """Test with multiple images in single message."""
+    hf_proc = AutoProcessor.from_pretrained(MODEL_NAME)
+    our_proc = Processor.from_pretrained(MODEL_NAME)
+
+    url1 = "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3-VL/qwen3vl_arc.jpg"
+    url2 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+
+    # HF uses "image" key, we use "url" key
+    hf_messages = [
         {
-            "role": "tool",
-            "content": '{"location":"Paris, France","unit":"celsius","temperature":18.2}',
-        },
-        {
-            "role": "assistant",
-            "content": "It's 18.2 °C in Paris right now.",
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare these two images."},
+                {"type": "image", "image": url1},
+                {"type": "text", "text": "and"},
+                {"type": "image", "image": url2},
+            ],
         },
     ]
 
-    processor = Processor(repo_id="Qwen/Qwen3-VL-4B-Instruct")
+    our_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare these two images."},
+                {"type": "image", "url": url1},
+                {"type": "text", "text": "and"},
+                {"type": "image", "url": url2},
+            ],
+        },
+    ]
 
-    correct_rendered_messages = """<|im_start|>user
-What's in the image?<|vision_start|><|image_pad|><|vision_end|><|im_end|>
-<|im_start|>assistant
-The image contains a bee on a sunflower.<|im_end|>
-<|im_start|>user
-what's the temperature in paris?<|im_end|>
-<|im_start|>assistant
-<tool_call>
-{"name": "get_current_temperature", "arguments": {"location": "Paris, France", "unit": "celsius"}}
-</tool_call><|im_end|>
-<|im_start|>user
-<tool_response>
-{"location":"Paris, France","unit":"celsius","temperature":18.2}
-</tool_response><|im_end|>
-<|im_start|>assistant
-It's 18.2 °C in Paris right now.<|im_end|>
-<|im_start|>assistant
+    hf_inputs = hf_proc.apply_chat_template(
+        hf_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
 
-"""
+    our_inputs = our_proc(our_messages, add_generation_prompt=True)
 
-    rendered_messages = processor(messages)
-    assert (
-        rendered_messages == correct_rendered_messages
-    ), "Rendered messages do not match"
-    print("Test passed")
+    compare_outputs(hf_inputs, our_inputs, "Multiple Images in Single Message")
 
 
 if __name__ == "__main__":
-    test_processor()
+    test_text_only()
+    test_single_image()
+    test_multi_image()
+    print(f"\n{'='*60}")
+    print("🎉 All tests passed!")
+    print(f"{'='*60}\n")

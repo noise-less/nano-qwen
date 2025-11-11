@@ -1,202 +1,165 @@
-import json
 import torch
 import requests
-from io import BytesIO
-from PIL import Image
 import numpy as np
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
+import json
+from pathlib import Path
+from PIL import Image
+from io import BytesIO
+from typing import List, Tuple
 from tokenizers import Tokenizer
+from huggingface_hub import hf_hub_download
 
-from .vision import VisionConfig
-
-
+# fmt: off
+# Constants for message rendering
 USER_MESSAGE_TEMPLATE = "<|im_start|>user\n{content}<|im_end|>\n"
 ASSISTANT_MESSAGE_TEMPLATE = "<|im_start|>assistant\n{content}{tool_calls}<|im_end|>\n"
-TOOL_MESSAGE_TEMPLATE = (
-    "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
-)
+TOOL_MESSAGE_TEMPLATE = "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
 SYSTEM_MESSAGE_TEMPLATE = "<|im_start|>system\n{content}<|im_end|>\n"
+IMAGE_PAD_TOKEN = "<|image_pad|>"
+IMAGE_TEMPLATE = "<|vision_start|>{content}<|vision_end|>"
+TOOL_CALL_TEMPLATE = '<tool_call>\n{{"name": "{name}", "arguments": {arguments}}}\n</tool_call>'
+TOOL_RESPONSE_TEMPLATE = "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
 
-IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
-
-TOOL_CALL_TEMPLATE = (
-    '<tool_call>\n{{"name": "{name}", "arguments": {arguments}}}\n</tool_call>'
-)
-TOOL_RESPONSE_TEMPLATE = (
-    "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
-)
+# Constants for image processing
+IMAGE_MEAN = np.array([[[0.5, 0.5, 0.5]]], dtype=np.float32)
+IMAGE_STD = np.array([[[0.5, 0.5, 0.5]]], dtype=np.float32)
+SPATIAL_PATCH_SIZE = 16
+SPATIAL_MERGE_SIZE = 2
+TEMPORAL_PATCH_SIZE = 2
+# fmt: on
 
 
 class Processor:
-    def __init__(self, model_config):
-        self.tokenizer = Tokenizer.from_pretrained(model_config.repo_id)
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        min_pixels: int = 65536,
+        max_pixels: int = 16777216,
+    ):
+        self.tokenizer = tokenizer
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
 
-        if model_config.vision_config is not None:
-            # Vision-specific setup
-            image_pad_token = "<|image_pad|>"
-            vision_start_token = "<|vision_start|>"
-            vision_end_token = "<|vision_end|>"
-            self.tokenizer.add_special_tokens([image_pad_token])
-            self.vision_start_token_id = self.tokenizer.encode(vision_start_token).ids[
-                0
-            ]
-            self.image_pad_token_id = self.tokenizer.encode(image_pad_token).ids[0]
-            self.vision_end_token_id = self.tokenizer.encode(vision_end_token).ids[0]
+    @classmethod
+    def from_pretrained(cls, repo_id: str):
+        tokenizer = Tokenizer.from_pretrained(repo_id)
 
-            # Constants for image processing
-            self.MIN_PIXELS = 3136
-            self.MAX_PIXELS = 12845056
-            self.IMAGE_MEAN = np.array(
-                [0.48145466, 0.4578275, 0.40821073], dtype=np.float32
-            )
-            self.IMAGE_STD = np.array(
-                [0.26862954, 0.26130258, 0.27577711], dtype=np.float32
-            )
+        # Load preprocessor config to get size parameters
+        try:
+            config_path = hf_hub_download(repo_id, "preprocessor_config.json")
+            with open(config_path, "r") as f:
+                config = json.load(f)
+
+            # Extract size parameters
+            size = config.get("size", {})
+            min_pixels = size.get("shortest_edge", 65536)
+            max_pixels = size.get("longest_edge", 16777216)
+        except Exception:
+            # Fallback to defaults if config not found
+            min_pixels = 65536
+            max_pixels = 16777216
+
+        return cls(tokenizer, min_pixels=min_pixels, max_pixels=max_pixels)
 
     # Turn openai harmony style messages into model input tensors.
-    def __call__(self, messages: List[dict]) -> dict:
-        messages_str = self._render_messages(messages)
-        # input_ids = self.tokenizer.encode(messages_str).ids
-        # attention_mask = torch.ones_like(input_ids)
-        return messages_str
-        # pixels_list = []
-        # d_image_list = []
+    def __call__(
+        self, messages: List[dict], add_generation_prompt: bool = False
+    ) -> dict:
+        pixels_list = []
+        d_image_list = []
+        messages_str = ""
 
-        # # Identify if we have vision support
-        # has_vision = self.vision_config is not None
-        # if not has_vision:
-        #     # If we have no vision_config, do text-only
-        #     for item in inputs:
-        #         if isinstance(item, str):
-        #             input_ids.extend(self.tokenizer.encode(item).ids)
-        #         else:
-        #             raise ValueError(
-        #                 f"Images are not supported by a text-only model. Got {type(item)}"
-        #             )
-        # else:
-        #     # Vision + text model
-        #     merge_size = self.vision_config.spatial_merge_size
-        #     image_pad_token_id = self.image_pad_token_id
+        for message in messages:
+            role = message["role"]
+            content = message.get("content", [])
 
-        #     for item in inputs:
-        #         if isinstance(item, str):
-        #             # Handle text
-        #             input_ids.extend(self.tokenizer.encode(item).ids)
-        #         elif isinstance(item, Image.Image):
-        #             # Handle image
-        #             patches, t, h, w = self._process_image(item)
-        #             pixels_list.append(patches)
-        #             d_image_list.append([t, h, w])
+            tool_calls = message.get("tool_calls", [])
+            tool_calls = [self._render_tool_call(tool_call) for tool_call in tool_calls]
+            tool_call_str = "".join(tool_calls)
 
-        #             pad_token_count = (t * h * w) // (merge_size**2)
-        #             pad_tokens = [image_pad_token_id] * pad_token_count
-        #             input_ids.extend(pad_tokens)
-        #         else:
-        #             raise ValueError(f"Unsupported input type: {type(item)}")
-
-        # # Convert accumulated ids to tensor
-        # input_ids = torch.tensor([input_ids], dtype=torch.long)
-
-        # # Convert all images to tensor if there are any
-        # if pixels_list:
-        #     pixels_np = np.concatenate(pixels_list, axis=0)
-        #     pixels = torch.tensor(pixels_np, dtype=torch.float)
-        #     d_image = torch.tensor(d_image_list, dtype=torch.long)
-        # else:
-        #     pixels = None
-        #     d_image = None
-
-        # attention_mask = torch.ones_like(input_ids)
-
-        # return ModelInputs(
-        #     input_ids=input_ids,
-        #     attention_mask=attention_mask,
-        #     pixel_values=pixels,
-        #     image_grid_thw=d_image,
-        # )
-
-    def _render_messages(self, messages: List[dict]) -> str:
-        rendered = [self._render_message(message) for message in messages]
-        return "".join(rendered)
-
-    def _render_message(self, message: dict) -> str:
-        assert isinstance(message, dict), f"Message must be a dict, got {type(message)}"
-        assert "role" in message, f"Message must have a role, got {message}"
-
-        role = message["role"]
-        content = message.get("content", "")
-
-        tool_calls = message.get("tool_calls", [])
-        tool_calls = [self._render_tool_call(tool_call) for tool_call in tool_calls]
-        tool_call_str = "".join(tool_calls)
-
-        if isinstance(content, str):
-            content_str = content
-        elif isinstance(content, list):
-            content_str = "".join([self._render_content(item) for item in content])
-        else:
-            content_str = ""
-
-        if role == "system":
-            return SYSTEM_MESSAGE_TEMPLATE.format(content=content_str)
-        elif role == "user":
-            return USER_MESSAGE_TEMPLATE.format(content=content_str)
-        elif role == "assistant":
-            return ASSISTANT_MESSAGE_TEMPLATE.format(
-                content=content_str, tool_calls=tool_call_str
+            content_str = "".join(
+                [
+                    self._render_content(item, pixels_list, d_image_list)
+                    for item in content
+                ]
             )
-        elif role == "tool":
-            return TOOL_RESPONSE_TEMPLATE.format(content=content_str)
+
+            if role == "system":
+                messages_str += SYSTEM_MESSAGE_TEMPLATE.format(content=content_str)
+            elif role == "user":
+                messages_str += USER_MESSAGE_TEMPLATE.format(content=content_str)
+            elif role == "assistant":
+                messages_str += ASSISTANT_MESSAGE_TEMPLATE.format(
+                    content=content_str, tool_calls=tool_call_str
+                )
+            elif role == "tool":
+                messages_str += TOOL_RESPONSE_TEMPLATE.format(content=content_str)
+            else:
+                raise ValueError(f"Unsupported role: {role}")
+
+        # Add generation prompt if requested
+        if add_generation_prompt:
+            messages_str += "<|im_start|>assistant\n"
+
+        input_ids = self.tokenizer.encode(messages_str).ids
+        input_ids = torch.tensor([input_ids], dtype=torch.long)
+
+        if pixels_list:
+            pixels_np = np.concatenate(pixels_list, axis=0)
+            pixels = torch.tensor(pixels_np, dtype=torch.float)
+            d_image = torch.tensor(d_image_list, dtype=torch.long)
         else:
-            raise ValueError(f"Unsupported role: {role}")
+            pixels = None
+            d_image = None
 
-    def _render_content(self, content: dict | str) -> str:
-        assert isinstance(content, dict) or isinstance(
-            content, str
-        ), f"Content must be a string or a dict, got {type(content)}"
-        assert (
-            isinstance(content, dict) and "type" in content
-        ), f"Content must be a dict with a type, got {content}"
+        return {
+            "input_ids": input_ids,
+            "pixels": pixels,
+            "d_image": d_image,
+        }
 
-        if isinstance(content, str):
-            return content
+    def _render_content(
+        self, content: dict, pixels_list: list, d_image_list: list
+    ) -> str:
         if content["type"] == "text":
             return content["text"]
         elif content["type"] == "image":
-            return IMAGE_PLACEHOLDER
+            # Fetch image from URL or local path
+            if "url" not in content:
+                raise ValueError(
+                    f"Image content must have 'url' field with URL or local path, got {content}"
+                )
+            image = self._fetch_img_through_url(content["url"])
+
+            patches, grid_t, grid_h, grid_w = self._process_image(image)
+
+            pixels_list.append(patches)
+            d_image_list.append([grid_t, grid_h, grid_w])
+
+            pad_count = (grid_t * grid_h * grid_w) // (SPATIAL_MERGE_SIZE**2)
+            pad_tokens = IMAGE_PAD_TOKEN * pad_count
+            return IMAGE_TEMPLATE.format(content=pad_tokens)
         else:
             raise ValueError(f"Unsupported content type: {content['type']}")
 
     def _render_tool_call(self, tool_call: dict) -> str:
-        assert isinstance(
-            tool_call, dict
-        ), f"Tool call must be a dict, got {type(tool_call)}"
-        assert (
-            "name" in tool_call and "arguments" in tool_call
-        ), f"Tool call must have a name and arguments, got {tool_call}"
         return TOOL_CALL_TEMPLATE.format(
-            name=tool_call["name"],
-            arguments=tool_call["arguments"],
+            name=tool_call["name"], arguments=tool_call["arguments"]
         )
 
     def _fetch_img_through_url(self, url: str) -> Image.Image:
-        response = requests.get(url)
-        response.raise_for_status()
-        return Image.open(BytesIO(response.content))
+        # Accepts both local file path and remote URL
+        if url.startswith(("http://", "https://")):
+            response = requests.get(url)
+            response.raise_for_status()
+            return Image.open(BytesIO(response.content))
+        else:
+            return Image.open(url)
 
     def _process_image(self, image: Image.Image) -> Tuple[np.ndarray, int, int, int]:
-        SPATIAL_PATCH_SIZE = self.vision_config.spatial_patch_size
-        TEMPORAL_PATCH_SIZE = self.vision_config.temporal_patch_size
-        SPATIAL_MERGE_SIZE = self.vision_config.spatial_merge_size
-
         image_np = np.array(image, dtype=np.float32)
         height, width = image_np.shape[:2]
-        resized_height, resized_width = self._resize_image(
-            height,
-            width,
-            factor=SPATIAL_PATCH_SIZE * SPATIAL_MERGE_SIZE,
-        )
+        resized_height, resized_width = self._resize_image(height, width, num_frames=1)
         image_resized = image.resize(
             (resized_width, resized_height), resample=Image.BICUBIC
         )
@@ -204,9 +167,7 @@ class Processor:
 
         # Normalize
         image_np_resized = image_np_resized / 255.0
-        mean = self.IMAGE_MEAN.reshape(1, 1, -1)
-        std = self.IMAGE_STD.reshape(1, 1, -1)
-        image_np_resized = (image_np_resized - mean) / std
+        image_np_resized = (image_np_resized - IMAGE_MEAN) / IMAGE_STD
 
         # Convert to channels-first and add batch dimension
         image_np_resized = np.transpose(image_np_resized, (2, 0, 1))
@@ -243,8 +204,10 @@ class Processor:
         return flatten_patches.astype(np.float32), grid_t, grid_h, grid_w
 
     def _resize_image(
-        self, height: int, width: int, factor: int = 28
+        self, height: int, width: int, num_frames: int = 1
     ) -> Tuple[int, int]:
+        temporal_factor = TEMPORAL_PATCH_SIZE
+        factor = SPATIAL_PATCH_SIZE * SPATIAL_MERGE_SIZE
         if height < factor or width < factor:
             raise ValueError(
                 f"height:{height} or width:{width} must be larger than factor:{factor}"
@@ -256,13 +219,15 @@ class Processor:
 
         h_bar = round(height / factor) * factor
         w_bar = round(width / factor) * factor
+        t_bar = int(np.ceil(num_frames / temporal_factor) * temporal_factor)
 
-        if h_bar * w_bar > self.MAX_PIXELS:
-            beta = np.sqrt((height * width) / self.MAX_PIXELS)
-            h_bar = int(np.floor(height / beta / factor) * factor)
-            w_bar = int(np.floor(width / beta / factor) * factor)
-        elif h_bar * w_bar < self.MIN_PIXELS:
-            beta = np.sqrt(self.MIN_PIXELS / (height * width))
+        if t_bar * h_bar * w_bar > self.max_pixels:
+            beta = np.sqrt((num_frames * height * width) / self.max_pixels)
+            h_bar = max(factor, int(np.floor(height / beta / factor) * factor))
+            w_bar = max(factor, int(np.floor(width / beta / factor) * factor))
+        elif h_bar * w_bar < self.min_pixels:
+            # Check 2D area only (without temporal dimension) for min_pixels
+            beta = np.sqrt(self.min_pixels / (height * width))
             h_bar = int(np.ceil(height * beta / factor) * factor)
             w_bar = int(np.ceil(width * beta / factor) * factor)
 
