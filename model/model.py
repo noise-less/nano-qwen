@@ -1,61 +1,116 @@
+import json
 import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+from pathlib import Path
+from safetensors import safe_open
 from dataclasses import dataclass
+
+from accelerate import load_checkpoint_and_dispatch
 
 
 @dataclass
 class ModelConfig:
-    repo_id: str
     n_embed: int
     n_heads: int
     n_kv_heads: int
     n_layer: int
-    n_mlp: int
+    n_mlp: int  # dense MLP intermediate size
+
+    n_vocab: int
+    tie_word_embeddings: bool
+
     rope_theta: float
     rms_norm_eps: float
-    vocab_size: int
-    tie_word_embeddings: bool
-    head_dim: Optional[int] = None  # Explicit head dimension
 
     # MoE parameters
-    num_experts: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
-    moe_intermediate_size: Optional[int] = None
+    d_head: Optional[int] = None
+    n_experts: Optional[int] = None
+    n_experts_per_token: Optional[int] = None
+    n_moe_mlp: Optional[int] = None
+
+    @classmethod
+    def from_pretrained(cls, hf_config: dict):
+        # Map from hugging face transformers config names
+        return cls(
+            n_embed=hf_config["hidden_size"],
+            n_heads=hf_config["num_attention_heads"],
+            n_kv_heads=hf_config["num_key_value_heads"],
+            n_layer=hf_config["num_hidden_layers"],
+            n_mlp=hf_config["intermediate_size"],
+            n_vocab=hf_config["vocab_size"],
+            tie_word_embeddings=hf_config["tie_word_embeddings"],
+            rope_theta=hf_config["rope_theta"],
+            rms_norm_eps=hf_config["rms_norm_eps"],
+            d_head=hf_config.get("head_dim"),
+            n_experts=hf_config.get("num_experts"),
+            n_experts_per_token=hf_config.get("num_experts_per_tok"),
+            n_moe_mlp=hf_config.get("moe_intermediate_size"),
+        )
 
 
-class Qwen3RotaryEmbedding(nn.Module):
+class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # Use explicit head_dim if provided, otherwise calculate
+        # Use explicit d_head if provided, otherwise calculate
         d = (
-            config.head_dim
-            if config.head_dim is not None
+            config.d_head
+            if config.d_head is not None
             else (config.n_embed // config.n_heads)
         )
         t = config.rope_theta
         r = torch.arange(0, d, 2)
-        self.inv_freq = 1.0 / (t ** (r / d)).float()
+        self.register_buffer("inv_freq", 1.0 / (t ** (r / d)).float(), persistent=False)
+
+        # MRoPE section: hardcoded for all Qwen3-VL models
+        self.mrope_section = [24, 20, 20]
 
     def forward(self, x, position_ids):
-        # Check the dimensionality of position_ids to decide shape
-        # shape is typically B x T (2D) for text, or B x 3 x T (3D) for multimodal
-        if position_ids.dim() == 3:
-            inv_freq = self.inv_freq.unsqueeze(0).unsqueeze(0).to(x.device)
-        else:
-            inv_freq = self.inv_freq.to(x.device)
+        # Expand 2D position_ids to 3D for text-only (matches official implementation)
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        position_ids = position_ids.unsqueeze(-1)
-        freqs = position_ids * inv_freq
+        # Compute frequencies for each dimension (T, H, W)
+        # inv_freq: [head_dim // 2]
+        # position_ids: [3, B, T]
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        position_ids_expanded = position_ids[:, :, None, :].float()  # [3, B, 1, T]
+
+        # Compute freqs: [3, B, T, head_dim // 2]
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+
+        # Apply interleaved MRoPE
+        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+
+        # Concatenate and compute cos/sin
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos().to(x.dtype)
         sin = emb.sin().to(x.dtype)
         return cos, sin
 
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """Apply interleaved MRoPE to 3D rotary embeddings.
 
-class Qwen3DenseAttention(nn.Module):
+        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+        interleaved [THWTHWTHW...TT], preserving frequency continuity.
+
+        Args:
+            freqs: [3, B, T, head_dim // 2]
+            mrope_section: [24, 20, 20]
+        Returns:
+            freqs_t: [B, T, head_dim // 2]
+        """
+        freqs_t = freqs[0]  # Start with temporal dimension
+        for dim, offset in enumerate((1, 2), start=1):  # H, W
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+
+class DenseAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -63,17 +118,17 @@ class Qwen3DenseAttention(nn.Module):
         self.n_kv_heads = config.n_kv_heads
 
         self.n_embed = config.n_embed
-        self.n_embed_per_head = config.n_embed // config.n_heads
-        self.n_kv_embed = config.n_kv_heads * self.n_embed_per_head
+        self.d_head = config.d_head
+        self.n_kv_embed = config.n_kv_heads * config.d_head
+        self.n_q_embed = config.n_heads * config.d_head
 
-        self.q_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
+        self.q_proj = nn.Linear(self.n_embed, self.n_q_embed, bias=False)
         self.k_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
         self.v_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
-        self.o_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
+        self.o_proj = nn.Linear(self.n_q_embed, self.n_embed, bias=False)
 
-        # Qwen3 specific: q_norm and k_norm on head dimension
-        self.q_norm = Qwen3RMSNorm(self.n_embed_per_head, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.n_embed_per_head, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
         B, T, C = x.size()
@@ -82,11 +137,10 @@ class Qwen3DenseAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = q.view(B, T, self.n_heads, self.n_embed_per_head).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.n_embed_per_head).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.n_embed_per_head).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
 
-        # Apply normalization to q and k before RoPE (Qwen3 specific)
         q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
         k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
 
@@ -98,7 +152,7 @@ class Qwen3DenseAttention(nn.Module):
             v = v.repeat_interleave(num_repeat, dim=1)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_q_embed)
         y = self.o_proj(y)
         return y
 
@@ -106,15 +160,15 @@ class Qwen3DenseAttention(nn.Module):
     def _apply_rotary_pos_emb(q, k, cos, sin):
         if cos.dim() == 4:
             # shape [B, 3, T, D] -> multi-modal
-            cos = Qwen3DenseAttention._process_rotary_component(cos)
-            sin = Qwen3DenseAttention._process_rotary_component(sin)
+            cos = DenseAttention._process_rotary_component(cos)
+            sin = DenseAttention._process_rotary_component(sin)
         else:
             # shape [B, T, D] -> text-only
             cos = cos.unsqueeze(1)
             sin = sin.unsqueeze(1)
 
-        q_embed = (q * cos) + (Qwen3DenseAttention._rotate_half(q) * sin)
-        k_embed = (k * cos) + (Qwen3DenseAttention._rotate_half(k) * sin)
+        q_embed = (q * cos) + (DenseAttention._rotate_half(q) * sin)
+        k_embed = (k * cos) + (DenseAttention._rotate_half(k) * sin)
         return q_embed, k_embed
 
     @staticmethod
@@ -132,9 +186,7 @@ class Qwen3DenseAttention(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
-class Qwen3MoeAttention(nn.Module):
-    """Qwen3 MoE attention with explicit head_dim support"""
-
+class MoeAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -142,25 +194,19 @@ class Qwen3MoeAttention(nn.Module):
         self.n_kv_heads = config.n_kv_heads
         self.n_embed = config.n_embed
 
-        # Use explicit head_dim if provided, otherwise calculate
-        self.head_dim = (
-            config.head_dim
-            if config.head_dim is not None
+        self.d_head = (
+            config.d_head
+            if config.d_head is not None
             else (config.n_embed // config.n_heads)
         )
 
-        self.q_proj = nn.Linear(self.n_embed, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(
-            self.n_embed, self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            self.n_embed, self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.n_embed, bias=False)
+        self.q_proj = nn.Linear(self.n_embed, self.n_heads * self.d_head, bias=False)
+        self.k_proj = nn.Linear(self.n_embed, self.n_kv_heads * self.d_head, bias=False)
+        self.v_proj = nn.Linear(self.n_embed, self.n_kv_heads * self.d_head, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.d_head, self.n_embed, bias=False)
 
-        # Qwen3 specific: q_norm and k_norm on head dimension
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
         B, T, C = x.size()
@@ -169,9 +215,9 @@ class Qwen3MoeAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
 
         # Apply normalization to q and k before RoPE (Qwen3 specific)
         q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
@@ -185,7 +231,7 @@ class Qwen3MoeAttention(nn.Module):
             v = v.repeat_interleave(num_repeat, dim=1)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_head)
         y = self.o_proj(y)
         return y
 
@@ -193,15 +239,15 @@ class Qwen3MoeAttention(nn.Module):
     def _apply_rotary_pos_emb(q, k, cos, sin):
         if cos.dim() == 4:
             # shape [B, 3, T, D] -> multi-modal
-            cos = Qwen3MoeAttention._process_rotary_component(cos)
-            sin = Qwen3MoeAttention._process_rotary_component(sin)
+            cos = MoeAttention._process_rotary_component(cos)
+            sin = MoeAttention._process_rotary_component(sin)
         else:
             # shape [B, T, D] -> text-only
             cos = cos.unsqueeze(1)
             sin = sin.unsqueeze(1)
 
-        q_embed = (q * cos) + (Qwen3MoeAttention._rotate_half(q) * sin)
-        k_embed = (k * cos) + (Qwen3MoeAttention._rotate_half(k) * sin)
+        q_embed = (q * cos) + (MoeAttention._rotate_half(q) * sin)
+        k_embed = (k * cos) + (MoeAttention._rotate_half(k) * sin)
         return q_embed, k_embed
 
     @staticmethod
@@ -219,7 +265,7 @@ class Qwen3MoeAttention(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
-class Qwen3RMSNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, n_embed, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(n_embed))
@@ -233,7 +279,7 @@ class Qwen3RMSNorm(nn.Module):
         return self.weight * x.to(input_dtype)
 
 
-class Qwen3DenseMLP(nn.Module):
+class DenseMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.gate_proj = nn.Linear(config.n_embed, config.n_mlp, bias=False)
@@ -244,65 +290,56 @@ class Qwen3DenseMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3MoEMLP(nn.Module):
+class MoEMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.num_experts = config.num_experts
-        self.gate = nn.Linear(config.n_embed, config.num_experts, bias=False)
+        self.n_experts_per_token = config.n_experts_per_token
+        self.n_experts = config.n_experts
+        self.gate = nn.Linear(config.n_embed, config.n_experts, bias=False)
 
         # Expert layers with proper naming to match checkpoint
         self.experts = nn.ModuleList()
-        for _ in range(config.num_experts):
+        for _ in range(config.n_experts):
             expert = nn.Module()
-            expert.gate_proj = nn.Linear(
-                config.n_embed, config.moe_intermediate_size, bias=False
-            )
-            expert.up_proj = nn.Linear(
-                config.n_embed, config.moe_intermediate_size, bias=False
-            )
-            expert.down_proj = nn.Linear(
-                config.moe_intermediate_size, config.n_embed, bias=False
-            )
+            expert.gate_proj = nn.Linear(config.n_embed, config.n_moe_mlp, bias=False)
+            expert.up_proj = nn.Linear(config.n_embed, config.n_moe_mlp, bias=False)
+            expert.down_proj = nn.Linear(config.n_moe_mlp, config.n_embed, bias=False)
             self.experts.append(expert)
 
     def forward(self, x):
-        b, seq_len, embed_dim = x.shape
-        scores = self.gate(x)  # (b, seq_len, num_experts)
-        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
+        scores = self.gate(x)  # (b, seq_len, n_experts)
+        topk_scores, topk_indices = torch.topk(scores, self.n_experts_per_token, dim=-1)
         topk_probs = torch.softmax(topk_scores, dim=-1)
 
         expert_outputs = []
-        for e in range(self.num_experts):
+        for e in range(self.n_experts):
             expert = self.experts[e]
             hidden = F.silu(expert.gate_proj(x)) * expert.up_proj(x)
             out = expert.down_proj(hidden)
             expert_outputs.append(out.unsqueeze(-2))
-        expert_outputs = torch.cat(
-            expert_outputs, dim=-2
-        )  # (b, t, num_experts, emb_dim)
+        expert_outputs = torch.cat(expert_outputs, dim=-2)  # (b, t, n_experts, emb_dim)
 
         gating_probs = torch.zeros_like(scores)
 
-        for i in range(self.num_experts_per_tok):
+        for i in range(self.n_experts_per_token):
             indices = topk_indices[..., i : i + 1]
             prob = topk_probs[..., i : i + 1]
             gating_probs.scatter_(dim=-1, index=indices, src=prob)
-        gating_probs = gating_probs.unsqueeze(-1)  # (b, t, num_experts, 1)
+        gating_probs = gating_probs.unsqueeze(-1)  # (b, t, n_experts, 1)
 
         # Weighted sum over experts
         y = (gating_probs * expert_outputs).sum(dim=-2)
         return y
 
 
-class Qwen3DenseBlock(nn.Module):
+class DenseBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
-        self.input_layernorm = Qwen3RMSNorm(n_embed=n_embed, eps=eps)
-        self.self_attn = Qwen3DenseAttention(config)
-        self.post_attention_layernorm = Qwen3RMSNorm(n_embed=n_embed, eps=eps)
-        self.mlp = Qwen3DenseMLP(config)
+        self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+        self.self_attn = DenseAttention(config)
+        self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+        self.mlp = DenseMLP(config)
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
@@ -310,19 +347,19 @@ class Qwen3DenseBlock(nn.Module):
         return x
 
 
-class Qwen3MoEBlock(nn.Module):
+class MoEBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
-        self.input_layernorm = Qwen3RMSNorm(n_embed=n_embed, eps=eps)
-        self.self_attn = Qwen3MoeAttention(config)
-        self.post_attention_layernorm = Qwen3RMSNorm(n_embed=n_embed, eps=eps)
+        self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+        self.self_attn = MoeAttention(config)
+        self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
 
         # Use MoE if experts are configured, otherwise regular MLP
-        if config.num_experts and config.num_experts > 0:
-            self.mlp = Qwen3MoEMLP(config)
+        if config.n_experts and config.n_experts > 0:
+            self.mlp = MoEMLP(config)
         else:
-            self.mlp = Qwen3DenseMLP(config)
+            self.mlp = DenseMLP(config)
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
@@ -330,20 +367,14 @@ class Qwen3MoEBlock(nn.Module):
         return x
 
 
-class Qwen3DenseModel(nn.Module):
+class DenseModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.n_embed)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.embed_tokens = nn.Embedding(config.n_vocab, config.n_embed)
+        self.rotary_emb = RotaryEmbedding(config)
 
-        # Use Qwen3Block with proper attention
-        self.layers = nn.ModuleList(
-            Qwen3DenseBlock(config) for _ in range(config.n_layer)
-        )
-        self.norm = Qwen3RMSNorm(config.n_embed, eps=config.rms_norm_eps)
-
-        # Store config for convenience
-        self.config = config
+        self.layers = nn.ModuleList(DenseBlock(config) for _ in range(config.n_layer))
+        self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
     def forward(self, x, position_ids):
         cos, sin = self.rotary_emb(x, position_ids)
@@ -356,14 +387,14 @@ class Qwen3DenseModel(nn.Module):
 class Qwen3Dense(nn.Module):
     """Qwen3 dense model - text-only version"""
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.model = Qwen3DenseModel(config)
+        self.language_model = DenseModel(config)
 
         self.lm_head = None
         if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+            self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
 
     def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
@@ -373,29 +404,36 @@ class Qwen3Dense(nn.Module):
         return position_ids
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.model.embed_tokens(input_ids)
+        x = self.language_model.embed_tokens(input_ids)
         position_ids = self._get_position_ids(input_ids)
-        x = self.model(x=x, position_ids=position_ids)
+        x = self.language_model(x=x, position_ids=position_ids)
 
         if self.lm_head is None:
-            logits = torch.matmul(x, self.model.embed_tokens.weight.T)
+            logits = torch.matmul(x, self.language_model.embed_tokens.weight.T)
         else:
             logits = self.lm_head(x)
         return logits
+
+
+class Qwen3(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.model = Qwen3Dense(config)
+
+    def forward(self, input_ids: torch.Tensor):
+        x = self.model(input_ids)
+        return x
 
     def generate(
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int = 1,
         stop_tokens: list = None,
-        stream: bool = False,
     ):
         if stop_tokens is None:
-            stop_tokens = [
-                151645,
-                151644,
-                151643,
-            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+            # <|im_end|>, <|im_start|>, <|endoftext|>
+            stop_tokens = [151645, 151644, 151643]
 
         self.eval()
         with torch.no_grad():
@@ -406,42 +444,43 @@ class Qwen3Dense(nn.Module):
                 next_token = probs.argmax(dim=-1, keepdim=True)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
-                # If streaming, yield the new token
-                if stream:
-                    yield next_token.item()
-
                 # Check if we hit a stop token
                 if next_token.item() in stop_tokens:
                     break
 
-        # If not streaming, return the full input_ids
-        if not stream:
-            return input_ids
+        return input_ids
 
     @classmethod
-    def get_config_class(cls):
-        return Qwen3Config
+    def from_pretrained(cls, weights_path: str, device_map: str = "auto"):
+        model_path = Path(weights_path)
 
-    @classmethod
-    def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
-        from .util import load_pretrained_model
+        with open(model_path / "config.json", "r") as f:
+            hf_config = json.load(f)
+        config = ModelConfig.from_pretrained(hf_config["text_config"])
 
-        return load_pretrained_model(cls, repo_id, device_map=device_map)
+        model = cls(config)
+
+        # Use accelerate to load weights efficiently without loading all to RAM
+        model = load_checkpoint_and_dispatch(
+            model,
+            checkpoint=str(model_path),
+            device_map=device_map,
+            no_split_module_classes=["DenseBlock"],
+            dtype=torch.bfloat16,
+        )
+
+        return model
 
 
-class Qwen3MoEModel(nn.Module):
-    """MoE for Mixture of Experts"""
-
+class MoEModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.n_embed)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.embed_tokens = nn.Embedding(config.n_vocab, config.n_embed)
+        self.rotary_emb = RotaryEmbedding(config)
 
         # Use Qwen3MoeBlock with proper attention and MoE
-        self.layers = nn.ModuleList(
-            Qwen3MoEBlock(config) for _ in range(config.n_layer)
-        )
-        self.norm = Qwen3RMSNorm(config.n_embed, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList(MoEBlock(config) for _ in range(config.n_layer))
+        self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
         # Store config for convenience
         self.config = config
@@ -457,14 +496,14 @@ class Qwen3MoEModel(nn.Module):
 class Qwen3MoE(nn.Module):
     """Qwen3 MoE model - text-only version with mixture of experts"""
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.model = Qwen3MoEModel(config)
+        self.model = MoEModel(config)
 
         self.lm_head = None
         if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+            self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
 
     def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
@@ -492,11 +531,8 @@ class Qwen3MoE(nn.Module):
         stream: bool = False,
     ):
         if stop_tokens is None:
-            stop_tokens = [
-                151645,
-                151644,
-                151643,
-            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+            # <|im_end|>, <|im_start|>, <|endoftext|>
+            stop_tokens = [151645, 151644, 151643]
 
         self.eval()
         with torch.no_grad():
@@ -521,7 +557,7 @@ class Qwen3MoE(nn.Module):
 
     @classmethod
     def get_config_class(cls):
-        return Qwen3Config
+        return ModelConfig
 
     @classmethod
     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
@@ -540,16 +576,15 @@ HF_TO_LM_CONFIG = {
     "intermediate_size": "n_mlp",
     "rope_theta": "rope_theta",
     "rms_norm_eps": "rms_norm_eps",
-    "vocab_size": "vocab_size",
+    "vocab_size": "n_vocab",
     "tie_word_embeddings": "tie_word_embeddings",
-    "head_dim": "head_dim",
+    "head_dim": "d_head",
     # MoE parameters
-    "num_experts": "num_experts",
-    "num_experts_per_tok": "num_experts_per_tok",
-    "moe_intermediate_size": "moe_intermediate_size",
+    "num_experts": "n_experts",
+    "num_experts_per_tok": "n_experts_per_token",
+    "moe_intermediate_size": "n_moe_mlp",
 }
 
 # Weight key mapping for loading HuggingFace pretrained language model weights
 # Maps: HuggingFace component name -> tiny-qwen component name
 HF_TO_LM_WEIGHTS = {}
-
