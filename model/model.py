@@ -35,19 +35,19 @@ class ModelConfig:
     def from_pretrained(cls, hf_config: dict):
         # Map from hugging face transformers config names
         return cls(
-            n_embed=hf_config["hidden_size"],
-            n_heads=hf_config["num_attention_heads"],
-            n_kv_heads=hf_config["num_key_value_heads"],
-            n_layer=hf_config["num_hidden_layers"],
-            n_mlp=hf_config["intermediate_size"],
-            n_vocab=hf_config["vocab_size"],
+            n_embed=hf_config["text_config"]["hidden_size"],
+            n_heads=hf_config["text_config"]["num_attention_heads"],
+            n_kv_heads=hf_config["text_config"]["num_key_value_heads"],
+            n_layer=hf_config["text_config"]["num_hidden_layers"],
+            n_mlp=hf_config["text_config"]["intermediate_size"],
+            n_vocab=hf_config["text_config"]["vocab_size"],
             tie_word_embeddings=hf_config["tie_word_embeddings"],
-            rope_theta=hf_config["rope_theta"],
-            rms_norm_eps=hf_config["rms_norm_eps"],
-            d_head=hf_config.get("head_dim"),
-            n_experts=hf_config.get("num_experts"),
-            n_experts_per_token=hf_config.get("num_experts_per_tok"),
-            n_moe_mlp=hf_config.get("moe_intermediate_size"),
+            rope_theta=hf_config["text_config"]["rope_theta"],
+            rms_norm_eps=hf_config["text_config"]["rms_norm_eps"],
+            d_head=hf_config["text_config"].get("head_dim"),
+            n_experts=hf_config["text_config"].get("num_experts"),
+            n_experts_per_token=hf_config["text_config"].get("num_experts_per_tok"),
+            n_moe_mlp=hf_config["text_config"].get("moe_intermediate_size"),
         )
 
 
@@ -64,43 +64,26 @@ class RotaryEmbedding(nn.Module):
         r = torch.arange(0, d, 2)
         self.register_buffer("inv_freq", 1.0 / (t ** (r / d)).float(), persistent=False)
 
-        # MRoPE section: hardcoded for all Qwen3-VL models
         self.mrope_section = [24, 20, 20]
 
     def forward(self, x, position_ids):
-        # Expand 2D position_ids to 3D for text-only (matches official implementation)
-        if position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-
-        # Compute frequencies for each dimension (T, H, W)
-        # inv_freq: [head_dim // 2]
-        # position_ids: [3, B, T]
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
-        position_ids_expanded = position_ids[:, :, None, :].float()  # [3, B, 1, T]
-
-        # Compute freqs: [3, B, T, head_dim // 2]
+        inv_freq = self.inv_freq.to(dtype=torch.float32, device=x.device)
+        inv_freq_expanded = inv_freq[None, None, :, None].expand(
+            3, position_ids.shape[1], -1, 1
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
-
-        # Apply interleaved MRoPE
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
 
-        # Concatenate and compute cos/sin
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos().to(x.dtype)
         sin = emb.sin().to(x.dtype)
         return cos, sin
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-
+        """
         Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
         interleaved [THWTHWTHW...TT], preserving frequency continuity.
-
-        Args:
-            freqs: [3, B, T, head_dim // 2]
-            mrope_section: [24, 20, 20]
-        Returns:
-            freqs_t: [B, T, head_dim // 2]
         """
         freqs_t = freqs[0]  # Start with temporal dimension
         for dim, offset in enumerate((1, 2), start=1):  # H, W
@@ -158,26 +141,11 @@ class DenseAttention(nn.Module):
 
     @staticmethod
     def _apply_rotary_pos_emb(q, k, cos, sin):
-        if cos.dim() == 4:
-            # shape [B, 3, T, D] -> multi-modal
-            cos = DenseAttention._process_rotary_component(cos)
-            sin = DenseAttention._process_rotary_component(sin)
-        else:
-            # shape [B, T, D] -> text-only
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
-
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         q_embed = (q * cos) + (DenseAttention._rotate_half(q) * sin)
         k_embed = (k * cos) + (DenseAttention._rotate_half(k) * sin)
         return q_embed, k_embed
-
-    @staticmethod
-    def _process_rotary_component(x):
-        # Split into sections and select appropriate indices
-        sections = x.split([16, 24, 24, 16, 24, 24], dim=-1)
-        processed = [m[i % 3] for i, m in enumerate(sections)]
-        # Combine and add dimension
-        return torch.cat(processed, dim=-1).unsqueeze(1)
 
     @staticmethod
     def _rotate_half(x):
@@ -237,26 +205,11 @@ class MoeAttention(nn.Module):
 
     @staticmethod
     def _apply_rotary_pos_emb(q, k, cos, sin):
-        if cos.dim() == 4:
-            # shape [B, 3, T, D] -> multi-modal
-            cos = MoeAttention._process_rotary_component(cos)
-            sin = MoeAttention._process_rotary_component(sin)
-        else:
-            # shape [B, T, D] -> text-only
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
-
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         q_embed = (q * cos) + (MoeAttention._rotate_half(q) * sin)
         k_embed = (k * cos) + (MoeAttention._rotate_half(k) * sin)
         return q_embed, k_embed
-
-    @staticmethod
-    def _process_rotary_component(x):
-        # Split into sections and select appropriate indices
-        sections = x.split([16, 24, 24, 16, 24, 24], dim=-1)
-        processed = [m[i % 3] for i, m in enumerate(sections)]
-        # Combine and add dimension
-        return torch.cat(processed, dim=-1).unsqueeze(1)
 
     @staticmethod
     def _rotate_half(x):
@@ -377,6 +330,7 @@ class DenseModel(nn.Module):
         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
     def forward(self, x, position_ids):
+        x = self.embed_tokens(x)
         cos, sin = self.rotary_emb(x, position_ids)
         for layer in self.layers:
             x = layer(x, cos, sin)
@@ -385,8 +339,6 @@ class DenseModel(nn.Module):
 
 
 class Qwen3Dense(nn.Module):
-    """Qwen3 dense model - text-only version"""
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -400,16 +352,16 @@ class Qwen3Dense(nn.Module):
         B, T = input_ids.shape
         device = input_ids.device
         position_ids = torch.arange(T, dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).expand(B, -1)
+        position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
         return position_ids
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.language_model.embed_tokens(input_ids)
         position_ids = self._get_position_ids(input_ids)
-        x = self.language_model(x=x, position_ids=position_ids)
-
+        x = self.language_model(x=input_ids, position_ids=position_ids)
+        target_dtype = self.language_model.embed_tokens.weight.dtype
+        x = x.to(target_dtype)
         if self.lm_head is None:
-            logits = torch.matmul(x, self.language_model.embed_tokens.weight.T)
+            logits = torch.matmul(x, self.language_model.embed_tokens.weight.T.to(target_dtype))
         else:
             logits = self.lm_head(x)
         return logits
@@ -420,6 +372,11 @@ class Qwen3(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3Dense(config)
+
+        # Match lm_head dtype with embeddings for checkpoints stored in float32
+        if self.model.lm_head is not None:
+            target_dtype = self.model.language_model.embed_tokens.weight.dtype
+            self.model.lm_head = self.model.lm_head.to(target_dtype)
 
     def forward(self, input_ids: torch.Tensor):
         x = self.model(input_ids)
@@ -456,7 +413,7 @@ class Qwen3(nn.Module):
 
         with open(model_path / "config.json", "r") as f:
             hf_config = json.load(f)
-        config = ModelConfig.from_pretrained(hf_config["text_config"])
+        config = ModelConfig.from_pretrained(hf_config)
 
         model = cls(config)
 
@@ -494,8 +451,6 @@ class MoEModel(nn.Module):
 
 
 class Qwen3MoE(nn.Module):
-    """Qwen3 MoE model - text-only version with mixture of experts"""
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -513,12 +468,14 @@ class Qwen3MoE(nn.Module):
         return position_ids
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.model.embed_tokens(input_ids)
+        target_dtype = self.model.embed_tokens.weight.dtype
+        x = self.model.embed_tokens(input_ids).to(target_dtype)
         position_ids = self._get_position_ids(input_ids)
         x = self.model(x=x, position_ids=position_ids)
 
+        x = x.to(target_dtype)
         if self.lm_head is None:
-            logits = torch.matmul(x, self.model.embed_tokens.weight.T)
+            logits = torch.matmul(x, self.model.embed_tokens.weight.T.to(target_dtype))
         else:
             logits = self.lm_head(x)
         return logits
@@ -564,27 +521,3 @@ class Qwen3MoE(nn.Module):
         from .util import load_pretrained_model
 
         return load_pretrained_model(cls, repo_id, device_map=device_map)
-
-
-# Configuration key mapping for loading HuggingFace pretrained language models
-# Maps: HuggingFace config key -> tiny-qwen config key
-HF_TO_LM_CONFIG = {
-    "hidden_size": "n_embed",
-    "num_attention_heads": "n_heads",
-    "num_key_value_heads": "n_kv_heads",
-    "num_hidden_layers": "n_layer",
-    "intermediate_size": "n_mlp",
-    "rope_theta": "rope_theta",
-    "rms_norm_eps": "rms_norm_eps",
-    "vocab_size": "n_vocab",
-    "tie_word_embeddings": "tie_word_embeddings",
-    "head_dim": "d_head",
-    # MoE parameters
-    "num_experts": "n_experts",
-    "num_experts_per_tok": "n_experts_per_token",
-    "moe_intermediate_size": "n_moe_mlp",
-}
-
-# Weight key mapping for loading HuggingFace pretrained language model weights
-# Maps: HuggingFace component name -> tiny-qwen component name
-HF_TO_LM_WEIGHTS = {}
