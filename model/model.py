@@ -1,11 +1,9 @@
 import json
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 from pathlib import Path
-from safetensors import safe_open
 from dataclasses import dataclass
 
 from accelerate import load_checkpoint_and_dispatch
@@ -54,12 +52,7 @@ class ModelConfig:
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # Use explicit d_head if provided, otherwise calculate
-        d = (
-            config.d_head
-            if config.d_head is not None
-            else (config.n_embed // config.n_heads)
-        )
+        d = config.d_head
         t = config.rope_theta
         r = torch.arange(0, d, 2)
         self.register_buffer("inv_freq", 1.0 / (t ** (r / d)).float(), persistent=False)
@@ -93,80 +86,14 @@ class RotaryEmbedding(nn.Module):
         return freqs_t
 
 
-class DenseAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
         self.n_heads = config.n_heads
-        self.n_kv_heads = config.n_kv_heads
-
-        self.n_embed = config.n_embed
         self.d_head = config.d_head
-        self.n_kv_embed = config.n_kv_heads * config.d_head
-        self.n_q_embed = config.n_heads * config.d_head
-
-        self.q_proj = nn.Linear(self.n_embed, self.n_q_embed, bias=False)
-        self.k_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
-        self.v_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
-        self.o_proj = nn.Linear(self.n_q_embed, self.n_embed, bias=False)
-
-        self.q_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
-
-    def forward(self, x, cos, sin):
-        B, T, C = x.size()
-
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
-
-        q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
-        k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
-
-        q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
-
-        if self.n_kv_heads < self.n_heads:
-            num_repeat = self.n_heads // self.n_kv_heads
-            k = k.repeat_interleave(num_repeat, dim=1)
-            v = v.repeat_interleave(num_repeat, dim=1)
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_q_embed)
-        y = self.o_proj(y)
-        return y
-
-    @staticmethod
-    def _apply_rotary_pos_emb(q, k, cos, sin):
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q_embed = (q * cos) + (DenseAttention._rotate_half(q) * sin)
-        k_embed = (k * cos) + (DenseAttention._rotate_half(k) * sin)
-        return q_embed, k_embed
-
-    @staticmethod
-    def _rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-
-class MoeAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.n_embed = config.n_embed
-
-        self.d_head = (
-            config.d_head
-            if config.d_head is not None
-            else (config.n_embed // config.n_heads)
-        )
 
         self.q_proj = nn.Linear(self.n_embed, self.n_heads * self.d_head, bias=False)
         self.k_proj = nn.Linear(self.n_embed, self.n_kv_heads * self.d_head, bias=False)
@@ -179,15 +106,10 @@ class MoeAttention(nn.Module):
     def forward(self, x, cos, sin):
         B, T, C = x.size()
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
 
-        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
-
-        # Apply normalization to q and k before RoPE (Qwen3 specific)
         q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
         k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
 
@@ -207,8 +129,8 @@ class MoeAttention(nn.Module):
     def _apply_rotary_pos_emb(q, k, cos, sin):
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        q_embed = (q * cos) + (MoeAttention._rotate_half(q) * sin)
-        k_embed = (k * cos) + (MoeAttention._rotate_half(k) * sin)
+        q_embed = (q * cos) + (SelfAttention._rotate_half(q) * sin)
+        k_embed = (k * cos) + (SelfAttention._rotate_half(k) * sin)
         return q_embed, k_embed
 
     @staticmethod
@@ -285,14 +207,14 @@ class MoEMLP(nn.Module):
         return y
 
 
-class DenseBlock(nn.Module):
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
         self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
-        self.self_attn = DenseAttention(config)
+        self.self_attn = SelfAttention(config)
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
-        self.mlp = DenseMLP(config)
+        self.mlp = MoEMLP(config) if config.n_experts else DenseMLP(config)
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
@@ -300,33 +222,13 @@ class DenseBlock(nn.Module):
         return x
 
 
-class MoEBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        n_embed, eps = config.n_embed, config.rms_norm_eps
-        self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
-        self.self_attn = MoeAttention(config)
-        self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
-
-        # Use MoE if experts are configured, otherwise regular MLP
-        if config.n_experts and config.n_experts > 0:
-            self.mlp = MoEMLP(config)
-        else:
-            self.mlp = DenseMLP(config)
-
-    def forward(self, x, cos, sin):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
-
-
-class DenseModel(nn.Module):
+class Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.n_vocab, config.n_embed)
         self.rotary_emb = RotaryEmbedding(config)
 
-        self.layers = nn.ModuleList(DenseBlock(config) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(Block(config) for _ in range(config.n_layer))
         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
     def forward(self, x, position_ids):
@@ -338,49 +240,26 @@ class DenseModel(nn.Module):
         return x
 
 
-class Qwen3Dense(nn.Module):
+class Qwen3VL(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.language_model = DenseModel(config)
 
-        self.lm_head = None
+        # Wrap in a model container to match checkpoint structure
+        self.model = nn.Module()
+        self.model.language_model = Model(config)
+        self.model.lm_head = None
         if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
-
-    def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, T = input_ids.shape
-        device = input_ids.device
-        position_ids = torch.arange(T, dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
-        return position_ids
+            self.model.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         position_ids = self._get_position_ids(input_ids)
-        x = self.language_model(x=input_ids, position_ids=position_ids)
-        target_dtype = self.language_model.embed_tokens.weight.dtype
-        x = x.to(target_dtype)
-        if self.lm_head is None:
-            logits = torch.matmul(x, self.language_model.embed_tokens.weight.T.to(target_dtype))
+        x = self.model.language_model(x=input_ids, position_ids=position_ids)
+        if self.model.lm_head is None:
+            logits = torch.matmul(x, self.model.language_model.embed_tokens.weight.T)
         else:
-            logits = self.lm_head(x)
+            logits = self.model.lm_head(x)
         return logits
-
-
-class Qwen3(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
-        self.model = Qwen3Dense(config)
-
-        # Match lm_head dtype with embeddings for checkpoints stored in float32
-        if self.model.lm_head is not None:
-            target_dtype = self.model.language_model.embed_tokens.weight.dtype
-            self.model.lm_head = self.model.lm_head.to(target_dtype)
-
-    def forward(self, input_ids: torch.Tensor):
-        x = self.model(input_ids)
-        return x
 
     def generate(
         self,
@@ -422,102 +301,171 @@ class Qwen3(nn.Module):
             model,
             checkpoint=str(model_path),
             device_map=device_map,
-            no_split_module_classes=["DenseBlock"],
+            no_split_module_classes=["Block"],
             dtype=torch.bfloat16,
         )
 
         return model
 
-
-class MoEModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.embed_tokens = nn.Embedding(config.n_vocab, config.n_embed)
-        self.rotary_emb = RotaryEmbedding(config)
-
-        # Use Qwen3MoeBlock with proper attention and MoE
-        self.layers = nn.ModuleList(MoEBlock(config) for _ in range(config.n_layer))
-        self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
-
-        # Store config for convenience
-        self.config = config
-
-    def forward(self, x, position_ids):
-        cos, sin = self.rotary_emb(x, position_ids)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
-        x = self.norm(x)
-        return x
-
-
-class Qwen3MoE(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
-        self.model = MoEModel(config)
-
-        self.lm_head = None
-        if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
-
     def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
         device = input_ids.device
         position_ids = torch.arange(T, dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).expand(B, -1)
+        position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
         return position_ids
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.model.embed_tokens.weight.dtype
-        x = self.model.embed_tokens(input_ids).to(target_dtype)
-        position_ids = self._get_position_ids(input_ids)
-        x = self.model(x=x, position_ids=position_ids)
 
-        x = x.to(target_dtype)
-        if self.lm_head is None:
-            logits = torch.matmul(x, self.model.embed_tokens.weight.T.to(target_dtype))
-        else:
-            logits = self.lm_head(x)
-        return logits
+# class Qwen3(nn.Module):
+#     def __init__(self, config: ModelConfig):
+#         super().__init__()
+#         self.config = config
+#         self.model = Qwen3Dense(config)
 
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int = 1,
-        stop_tokens: list = None,
-        stream: bool = False,
-    ):
-        if stop_tokens is None:
-            # <|im_end|>, <|im_start|>, <|endoftext|>
-            stop_tokens = [151645, 151644, 151643]
+#         # Match lm_head dtype with embeddings for checkpoints stored in float32
+#         if self.model.lm_head is not None:
+#             target_dtype = self.model.language_model.embed_tokens.weight.dtype
+#             self.model.lm_head = self.model.lm_head.to(target_dtype)
 
-        self.eval()
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                logits = self.forward(input_ids=input_ids)
-                last_logits = logits[:, -1, :]
-                probs = F.softmax(last_logits, dim=-1)
-                next_token = probs.argmax(dim=-1, keepdim=True)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
+#     def forward(self, input_ids: torch.Tensor):
+#         x = self.model(input_ids)
+#         return x
 
-                # If streaming, yield the new token
-                if stream:
-                    yield next_token.item()
+#     def generate(
+#         self,
+#         input_ids: torch.Tensor,
+#         max_new_tokens: int = 1,
+#         stop_tokens: list = None,
+#     ):
+#         if stop_tokens is None:
+#             # <|im_end|>, <|im_start|>, <|endoftext|>
+#             stop_tokens = [151645, 151644, 151643]
 
-                # Check if we hit a stop token
-                if next_token.item() in stop_tokens:
-                    break
+#         self.eval()
+#         with torch.no_grad():
+#             for _ in range(max_new_tokens):
+#                 logits = self.forward(input_ids=input_ids)
+#                 last_logits = logits[:, -1, :]
+#                 probs = F.softmax(last_logits, dim=-1)
+#                 next_token = probs.argmax(dim=-1, keepdim=True)
+#                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
-        # If not streaming, return the full input_ids
-        if not stream:
-            return input_ids
+#                 # Check if we hit a stop token
+#                 if next_token.item() in stop_tokens:
+#                     break
 
-    @classmethod
-    def get_config_class(cls):
-        return ModelConfig
+#         return input_ids
 
-    @classmethod
-    def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
-        from .util import load_pretrained_model
+#     @classmethod
+#     def from_pretrained(cls, weights_path: str, device_map: str = "auto"):
+#         model_path = Path(weights_path)
 
-        return load_pretrained_model(cls, repo_id, device_map=device_map)
+#         with open(model_path / "config.json", "r") as f:
+#             hf_config = json.load(f)
+#         config = ModelConfig.from_pretrained(hf_config)
+
+#         model = cls(config)
+
+#         # Use accelerate to load weights efficiently without loading all to RAM
+#         model = load_checkpoint_and_dispatch(
+#             model,
+#             checkpoint=str(model_path),
+#             device_map=device_map,
+#             no_split_module_classes=["DenseBlock"],
+#             dtype=torch.bfloat16,
+#         )
+
+#         return model
+
+
+# class MoEModel(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.embed_tokens = nn.Embedding(config.n_vocab, config.n_embed)
+#         self.rotary_emb = RotaryEmbedding(config)
+
+#         # Use Qwen3MoeBlock with proper attention and MoE
+#         self.layers = nn.ModuleList(MoEBlock(config) for _ in range(config.n_layer))
+#         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
+
+#         # Store config for convenience
+#         self.config = config
+
+#     def forward(self, x, position_ids):
+#         cos, sin = self.rotary_emb(x, position_ids)
+#         for layer in self.layers:
+#             x = layer(x, cos, sin)
+#         x = self.norm(x)
+#         return x
+
+
+# class Qwen3MoE(nn.Module):
+#     def __init__(self, config: ModelConfig):
+#         super().__init__()
+#         self.config = config
+#         self.model = MoEModel(config)
+
+#         self.lm_head = None
+#         if not config.tie_word_embeddings:
+#             self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
+
+#     def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+#         B, T = input_ids.shape
+#         device = input_ids.device
+#         position_ids = torch.arange(T, dtype=torch.long, device=device)
+#         position_ids = position_ids.unsqueeze(0).expand(B, -1)
+#         return position_ids
+
+#     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+#         target_dtype = self.model.embed_tokens.weight.dtype
+#         x = self.model.embed_tokens(input_ids).to(target_dtype)
+#         position_ids = self._get_position_ids(input_ids)
+#         x = self.model(x=x, position_ids=position_ids)
+
+#         x = x.to(target_dtype)
+#         if self.lm_head is None:
+#             logits = torch.matmul(x, self.model.embed_tokens.weight.T.to(target_dtype))
+#         else:
+#             logits = self.lm_head(x)
+#         return logits
+
+#     def generate(
+#         self,
+#         input_ids: torch.Tensor,
+#         max_new_tokens: int = 1,
+#         stop_tokens: list = None,
+#         stream: bool = False,
+#     ):
+#         if stop_tokens is None:
+#             # <|im_end|>, <|im_start|>, <|endoftext|>
+#             stop_tokens = [151645, 151644, 151643]
+
+#         self.eval()
+#         with torch.no_grad():
+#             for _ in range(max_new_tokens):
+#                 logits = self.forward(input_ids=input_ids)
+#                 last_logits = logits[:, -1, :]
+#                 probs = F.softmax(last_logits, dim=-1)
+#                 next_token = probs.argmax(dim=-1, keepdim=True)
+#                 input_ids = torch.cat([input_ids, next_token], dim=1)
+
+#                 # If streaming, yield the new token
+#                 if stream:
+#                     yield next_token.item()
+
+#                 # Check if we hit a stop token
+#                 if next_token.item() in stop_tokens:
+#                     break
+
+#         # If not streaming, return the full input_ids
+#         if not stream:
+#             return input_ids
+
+#     @classmethod
+#     def get_config_class(cls):
+#         return ModelConfig
+
+#     @classmethod
+#     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
+#         from .util import load_pretrained_model
+
+#         return load_pretrained_model(cls, repo_id, device_map=device_map)

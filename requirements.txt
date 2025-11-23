@@ -8,3 +8,4 @@ pillow==11.2.1
 matplotlib==3.10.3
 prompt-toolkit==3.0.52
 lightning==2.5.3
+pytest==8.4.2
