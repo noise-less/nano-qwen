@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from accelerate import load_checkpoint_and_dispatch
 
+from .vision import VisionEncoder, VisionConfig
+
 
 @dataclass
 class ModelConfig:
@@ -32,20 +34,21 @@ class ModelConfig:
     @classmethod
     def from_pretrained(cls, hf_config: dict):
         # Map from hugging face transformers config names
+        llm_config = hf_config["text_config"]
         return cls(
-            n_embed=hf_config["text_config"]["hidden_size"],
-            n_heads=hf_config["text_config"]["num_attention_heads"],
-            n_kv_heads=hf_config["text_config"]["num_key_value_heads"],
-            n_layer=hf_config["text_config"]["num_hidden_layers"],
-            n_mlp=hf_config["text_config"]["intermediate_size"],
-            n_vocab=hf_config["text_config"]["vocab_size"],
+            n_embed=llm_config["hidden_size"],
+            n_heads=llm_config["num_attention_heads"],
+            n_kv_heads=llm_config["num_key_value_heads"],
+            n_layer=llm_config["num_hidden_layers"],
+            n_mlp=llm_config["intermediate_size"],
+            n_vocab=llm_config["vocab_size"],
             tie_word_embeddings=hf_config["tie_word_embeddings"],
-            rope_theta=hf_config["text_config"]["rope_theta"],
-            rms_norm_eps=hf_config["text_config"]["rms_norm_eps"],
-            d_head=hf_config["text_config"].get("head_dim"),
-            n_experts=hf_config["text_config"].get("num_experts"),
-            n_experts_per_token=hf_config["text_config"].get("num_experts_per_tok"),
-            n_moe_mlp=hf_config["text_config"].get("moe_intermediate_size"),
+            rope_theta=llm_config["rope_theta"],
+            rms_norm_eps=llm_config["rms_norm_eps"],
+            d_head=llm_config.get("head_dim"),
+            n_experts=llm_config.get("num_experts"),
+            n_experts_per_token=llm_config.get("num_experts_per_tok"),
+            n_moe_mlp=llm_config.get("moe_intermediate_size"),
         )
 
 
@@ -74,10 +77,7 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
-        """
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THWTHWTHW...TT], preserving frequency continuity.
-        """
+        """[TTT...HHH...WWW] -> [THWTHWTHW...TT]"""
         freqs_t = freqs[0]  # Start with temporal dimension
         for dim, offset in enumerate((1, 2), start=1):  # H, W
             length = mrope_section[dim] * 3
@@ -231,19 +231,44 @@ class Model(nn.Module):
         self.layers = nn.ModuleList(Block(config) for _ in range(config.n_layer))
         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
-    def forward(self, x, position_ids):
-        x = self.embed_tokens(x)
+    def forward(
+        self, x, position_ids, visual_pos_masks=None, deepstack_visual_embeds=None
+    ):
+        # x can be either token IDs (int) or embeddings (float)
+        if x.dtype in (torch.long, torch.int):
+            x = self.embed_tokens(x)
+
         cos, sin = self.rotary_emb(x, position_ids)
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             x = layer(x, cos, sin)
+            # Add deepstack visual features residually at early layers
+            if deepstack_visual_embeds is not None and layer_idx < len(
+                deepstack_visual_embeds
+            ):
+                x = self._deepstack_process(
+                    x, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+                )
         x = self.norm(x)
         return x
 
+    def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
+        """Add visual features residually to language model hidden states."""
+        if visual_pos_masks is None:
+            return hidden_states
+        hidden_states = hidden_states.clone()
+        hidden_states[visual_pos_masks, :] = (
+            hidden_states[visual_pos_masks, :] + visual_embeds
+        )
+        return hidden_states
+
 
 class Qwen3VL(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(
+        self, config: ModelConfig, vision_config: Optional[VisionConfig] = None
+    ):
         super().__init__()
         self.config = config
+        self.vision_config = vision_config
 
         # Wrap in a model container to match checkpoint structure
         self.model = nn.Module()
@@ -252,18 +277,68 @@ class Qwen3VL(nn.Module):
         if not config.tie_word_embeddings:
             self.model.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        position_ids = self._get_position_ids(input_ids)
-        x = self.model.language_model(x=input_ids, position_ids=position_ids)
+        # Add vision encoder if config provided
+        if vision_config is not None:
+            self.model.visual = VisionEncoder(vision_config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        pixels: Optional[torch.Tensor] = None,
+        d_image: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Get input embeddings
+        input_embeds = self.model.language_model.embed_tokens(input_ids)
+
+        visual_pos_masks = None
+        deepstack_visual_embeds = None
+
+        # Process vision inputs if provided
+        if pixels is not None and self.vision_config is not None:
+            # Convert pixels to same dtype as model weights
+            pixels = pixels.to(input_embeds.dtype)
+
+            # Encode images through vision encoder
+            image_embeds, deepstack_visual_embeds = self.model.visual(
+                pixels=pixels, d_image=d_image
+            )
+
+            # Create mask for image_pad tokens (token_id: 151655)
+            image_pad_mask = input_ids == 151655
+            visual_pos_masks = image_pad_mask
+
+            # Replace image_pad embeddings with actual image embeddings
+            image_pad_mask_expanded = image_pad_mask.unsqueeze(-1).expand_as(
+                input_embeds
+            )
+            input_embeds = input_embeds.masked_scatter(
+                image_pad_mask_expanded, image_embeds
+            )
+
+        # Generate position IDs for MRoPE
+        position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
+
+        # Forward through language model
+        x = self.model.language_model(
+            x=input_embeds,
+            position_ids=position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+
+        # Generate logits
         if self.model.lm_head is None:
             logits = torch.matmul(x, self.model.language_model.embed_tokens.weight.T)
         else:
             logits = self.model.lm_head(x)
+
         return logits
 
     def generate(
         self,
         input_ids: torch.Tensor,
+        pixels: Optional[torch.Tensor] = None,
+        d_image: Optional[torch.Tensor] = None,
         max_new_tokens: int = 1,
         stop_tokens: list = None,
     ):
@@ -274,7 +349,9 @@ class Qwen3VL(nn.Module):
         self.eval()
         with torch.no_grad():
             for _ in range(max_new_tokens):
-                logits = self.forward(input_ids=input_ids)
+                logits = self.forward(
+                    input_ids=input_ids, pixels=pixels, d_image=d_image
+                )
                 last_logits = logits[:, -1, :]
                 probs = F.softmax(last_logits, dim=-1)
                 next_token = probs.argmax(dim=-1, keepdim=True)
@@ -294,24 +371,100 @@ class Qwen3VL(nn.Module):
             hf_config = json.load(f)
         config = ModelConfig.from_pretrained(hf_config)
 
-        model = cls(config)
+        # Load vision config if present
+        vision_config = None
+        if "vision_config" in hf_config:
+            vision_config = VisionConfig.from_pretrained(hf_config)
+
+        model = cls(config, vision_config=vision_config)
 
         # Use accelerate to load weights efficiently without loading all to RAM
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=str(model_path),
             device_map=device_map,
-            no_split_module_classes=["Block"],
+            no_split_module_classes=["Block", "VisionBlock"],
             dtype=torch.bfloat16,
         )
 
         return model
 
-    def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _get_position_ids(
+        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         B, T = input_ids.shape
         device = input_ids.device
-        position_ids = torch.arange(T, dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
+
+        # Text-only case: simple sequential position IDs
+        if d_image is None:
+            position_ids = torch.arange(T, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
+            return position_ids
+
+        # Multimodal case: generate 3D position IDs for MRoPE
+        # Token IDs: vision_start=151652, image_pad=151655, vision_end=151653
+        vision_start_id = 151652
+        vision_end_id = 151653
+        spatial_merge_size = self.vision_config.spatial_merge_size
+
+        # Initialize position IDs with text positions
+        position_ids = torch.zeros(3, B, T, dtype=torch.long, device=device)
+
+        # For each sample in batch
+        for b in range(B):
+            seq = input_ids[b]
+            text_counter = 0
+            image_counter = 0
+
+            for i in range(T):
+                token_id = seq[i].item()
+
+                if token_id == vision_start_id:
+                    # Vision start token gets the current text position
+                    position_ids[:, b, i] = text_counter
+                    text_counter += 1
+
+                elif token_id == vision_end_id:
+                    # Vision end token gets the current text position
+                    position_ids[:, b, i] = text_counter
+                    text_counter += 1
+                    image_counter += 1
+
+                elif i > 0 and seq[i - 1] == vision_start_id:
+                    # First token after vision_start: beginning of image tokens
+                    # Calculate 3D positions [t, h, w] for this image
+                    t_img, h_img, w_img = d_image[image_counter]
+                    h_img = h_img // spatial_merge_size
+                    w_img = w_img // spatial_merge_size
+
+                    # Calculate how many image_pad tokens for this image
+                    image_tokens = t_img * h_img * w_img
+
+                    # Generate 3D position IDs
+                    for img_idx in range(image_tokens):
+                        if i + img_idx >= T:
+                            break
+
+                        t_pos = img_idx // (h_img * w_img)
+                        remaining = img_idx % (h_img * w_img)
+                        h_pos = remaining // w_img
+                        w_pos = remaining % w_img
+
+                        position_ids[0, b, i + img_idx] = t_pos
+                        position_ids[1, b, i + img_idx] = h_pos
+                        position_ids[2, b, i + img_idx] = w_pos
+
+                elif i > 0 and any(
+                    seq[j] == vision_start_id for j in range(max(0, i - 1000), i)
+                ):
+                    # We're inside an image region, skip (already handled above)
+                    continue
+
+                else:
+                    # Regular text token
+                    position_ids[:, b, i] = text_counter
+                    text_counter += 1
+
         return position_ids
 
 

@@ -35,12 +35,23 @@ def test_text_plus_image_generation():
     )
     inputs = inputs.to("cuda")
 
-    output_ids = model.generate(input_ids=inputs.input_ids, max_new_tokens=16)
+    # Extract vision inputs
+    # pixel_values shape: [num_patches, patch_dim] where patch_dim = 3*temporal*spatial*spatial
+    # image_grid_thw shape: [num_images, 3] where 3 = [t, h, w] dimensions
+    pixels = inputs.get("pixel_values", None)
+    d_image = inputs.get("image_grid_thw", None)
+
+    output_ids = model.generate(
+        input_ids=inputs.input_ids,
+        pixels=pixels,
+        d_image=d_image,
+        max_new_tokens=16,
+    )
     output_text = processor.batch_decode(
         output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )  # ['The image shows a close-up of a sunflower in a field. A bee']
 
-    expected = "user\nwhat is in the image?\nassistant\nThe image shows a close-up of a sunflower in a field. A bee"
+    expected = "user\nwhat is in the image?\nassistant\nThe image shows a sunflower field with a sunflower with a bee on it"
     assert output_text == [expected], f"Expected: {expected}\nGot: {output_text[0]}"
     print("========== Test Passed ==========")
 
