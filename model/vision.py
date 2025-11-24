@@ -10,15 +10,32 @@ class VisionConfig:
     n_embed: int
     n_layer: int
     n_heads: int
+    n_output_embed: int
+    n_mlp: int
+    deepstack_visual_indexes: list[int]
 
-    output_n_embed: int  # same as n_embed of the downstream model/LLM
+    in_channels: int = 3
+    temporal_patch_size: int = 2
+    patch_size: int = 16
+    spatial_merge_size: int = 2
 
-    in_channels: int
-
-    num_position_embeddings: int = 2304  # Max position embeddings for MRoPE
-    intermediate_size: int = None  # For gated MLP
-
-    deepstack_visual_indexes: list[int] = None
+    @classmethod
+    def from_pretrained(cls, hf_config: dict):
+        # Map from hugging face transformers config names
+        return cls(
+            n_embed=hf_config["vision_config"]["hidden_size"],
+            n_layer=hf_config["vision_config"]["depth"],
+            n_heads=hf_config["vision_config"]["num_heads"],
+            n_output_embed=hf_config["vision_config"]["out_hidden_size"],
+            n_mlp=hf_config["vision_config"]["intermediate_size"],
+            deepstack_visual_indexes=hf_config["vision_config"][
+                "deepstack_visual_indexes"
+            ],
+            in_channels=hf_config["vision_config"]["in_channels"],
+            temporal_patch_size=hf_config["vision_config"]["temporal_patch_size"],
+            patch_size=hf_config["vision_config"]["patch_size"],
+            spatial_merge_size=hf_config["vision_config"]["spatial_merge_size"],
+        )
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -36,40 +53,46 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.n_embed = config.n_embed
+
+        self.kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        self.stride = [self.temporal_patch_size, self.patch_size, self.patch_size]
+
         self.proj = nn.Conv3d(
-            in_channels=config.in_channels,
-            out_channels=config.n_embed,
-            kernel_size=[2, 16, 16],
-            stride=[2, 16, 16],
-            bias=False,
+            in_channels=self.in_channels,
+            out_channels=self.n_embed,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            bias=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states.view(
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(
             -1,
             self.in_channels,
             self.temporal_patch_size,
-            self.spatial_patch_size,
-            self.spatial_patch_size,
+            self.patch_size,
+            self.patch_size,
         )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
-        return hidden_states
+        x = self.proj(x).view(-1, self.n_embed)
+        return x
 
 
 class PatchMerger(nn.Module):
-    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
+        self.hidden_size = config.n_embed * (config.spatial_merge_size**2)
+        self.ln_q = nn.LayerNorm(config.n_embed, eps=1e-6)
 
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
-            nn.Linear(self.hidden_size, dim),
+            nn.Linear(self.hidden_size, config.n_output_embed),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -78,12 +101,12 @@ class PatchMerger(nn.Module):
 
 
 class VisionAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 16) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.n_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
+        self.n_heads = config.n_heads
+        self.head_dim = config.n_embed // config.n_heads
+        self.qkv = nn.Linear(config.n_embed, config.n_embed * 3, bias=True)
+        self.proj = nn.Linear(config.n_embed, config.n_embed)
 
     @staticmethod
     def _rotate_half(x):
@@ -107,13 +130,13 @@ class VisionAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        x: torch.Tensor,
         cu_seqlens: torch.Tensor = None,
         rotary_pos_emb: torch.Tensor = None,
     ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
+        seq_length = x.shape[0]
         q, k, v = (
-            self.qkv(hidden_states)
+            self.qkv(x)
             .reshape(seq_length, 3, self.n_heads, -1)
             .permute(1, 0, 2, 3)
             .unbind(0)
@@ -151,11 +174,10 @@ class VisionAttention(nn.Module):
 
 
 class VisionMLP(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        dim = config.n_embed
-        self.linear_fc1 = nn.Linear(dim, config.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(config.intermediate_size, dim, bias=True)
+        self.linear_fc1 = nn.Linear(config.n_embed, config.n_mlp, bias=True)
+        self.linear_fc2 = nn.Linear(config.n_mlp, config.n_embed, bias=True)
         self.act_fn = nn.GELU(approximate="tanh")  # gelu_pytorch_tanh
 
     def forward(self, x) -> torch.Tensor:
@@ -163,11 +185,11 @@ class VisionMLP(nn.Module):
 
 
 class VisionBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.n_embed, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.n_embed, eps=1e-6)
-        self.attn = VisionAttention(config.n_embed, config.n_heads)
+        self.attn = VisionAttention(config)
         self.mlp = VisionMLP(config)
 
     def forward(self, x, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
@@ -179,21 +201,16 @@ class VisionBlock(nn.Module):
 
 
 class VisionEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.patch_embed = PatchEmbed(config=config)
         self.blocks = nn.ModuleList(
             [VisionBlock(config) for _ in range(config.n_layer)]
         )
-        self.merger = PatchMerger(
-            dim=config.output_n_embed,
-            context_dim=config.n_embed,
-            spatial_merge_size=config.spatial_merge_size,
-        )
+        self.merger = PatchMerger(config=config)
         head_dim = config.n_embed // config.n_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
         self.spatial_merge_size = config.spatial_merge_size
-        self.in_channels = config.in_channels
 
     def rot_pos_emb(self, d_image: torch.Tensor) -> torch.Tensor:
         pos_ids = []
