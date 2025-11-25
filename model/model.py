@@ -165,46 +165,56 @@ class DenseMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class MoEExperts(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.n_experts
+        self.hidden_size = config.n_embed
+        self.expert_dim = config.n_moe_mlp
+
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.expert_dim, self.hidden_size)
+        )
+
+    def forward(self, x: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
+        gate_up = torch.einsum("th,ehq->teq", x, self.gate_up_proj)
+        gate, up = gate_up.chunk(2, dim=-1)
+        expert_outputs = torch.einsum("teq,eqh->teh", F.silu(gate) * up, self.down_proj)
+        weighted = expert_outputs * routing_weights.unsqueeze(-1)
+        return weighted.sum(dim=1)
+
+
 class MoEMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.n_experts_per_token = config.n_experts_per_token
-        self.n_experts = config.n_experts
-        self.gate = nn.Linear(config.n_embed, config.n_experts, bias=False)
-
-        # Expert layers with proper naming to match checkpoint
-        self.experts = nn.ModuleList()
-        for _ in range(config.n_experts):
-            expert = nn.Module()
-            expert.gate_proj = nn.Linear(config.n_embed, config.n_moe_mlp, bias=False)
-            expert.up_proj = nn.Linear(config.n_embed, config.n_moe_mlp, bias=False)
-            expert.down_proj = nn.Linear(config.n_moe_mlp, config.n_embed, bias=False)
-            self.experts.append(expert)
+        self.hidden_size = config.n_embed
+        self.expert_dim = config.n_moe_mlp
+        self.num_experts = config.n_experts
+        self.top_k = config.n_experts_per_token
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.experts = MoEExperts(config)
 
     def forward(self, x):
-        scores = self.gate(x)  # (b, seq_len, n_experts)
-        topk_scores, topk_indices = torch.topk(scores, self.n_experts_per_token, dim=-1)
-        topk_probs = torch.softmax(topk_scores, dim=-1)
+        bsz, seq_len, _ = x.shape
+        hidden = x.reshape(-1, self.hidden_size)
 
-        expert_outputs = []
-        for e in range(self.n_experts):
-            expert = self.experts[e]
-            hidden = F.silu(expert.gate_proj(x)) * expert.up_proj(x)
-            out = expert.down_proj(hidden)
-            expert_outputs.append(out.unsqueeze(-2))
-        expert_outputs = torch.cat(expert_outputs, dim=-2)  # (b, t, n_experts, emb_dim)
+        router_logits = self.gate(hidden)
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+        routed = torch.zeros_like(router_logits)
+        topk_weights = topk_weights.to(router_logits.dtype)
+        routed.scatter_(1, topk_indices, topk_weights)
+        routed = routed / (routed.sum(dim=-1, keepdim=True) + 1e-9)
+        routed = routed.to(hidden.dtype)
 
-        gating_probs = torch.zeros_like(scores)
+        expert_out = self.experts(hidden, routed)
+        combined = expert_out.view(bsz, seq_len, self.hidden_size)
 
-        for i in range(self.n_experts_per_token):
-            indices = topk_indices[..., i : i + 1]
-            prob = topk_probs[..., i : i + 1]
-            gating_probs.scatter_(dim=-1, index=indices, src=prob)
-        gating_probs = gating_probs.unsqueeze(-1)  # (b, t, n_experts, 1)
-
-        # Weighted sum over experts
-        y = (gating_probs * expert_outputs).sum(dim=-2)
-        return y
+        return combined, router_logits.to(hidden.dtype)
 
 
 class Block(nn.Module):
@@ -218,7 +228,10 @@ class Block(nn.Module):
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        mlp_out = self.mlp(self.post_attention_layernorm(x))
+        if isinstance(mlp_out, tuple):
+            mlp_out = mlp_out[0]
+        x = x + mlp_out
         return x
 
 
@@ -242,12 +255,19 @@ class Model(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             x = layer(x, cos, sin)
             # Add deepstack visual features residually at early layers
-            if deepstack_visual_embeds is not None and layer_idx < len(
-                deepstack_visual_embeds
-            ):
-                x = self._deepstack_process(
-                    x, visual_pos_masks, deepstack_visual_embeds[layer_idx]
-                )
+            if deepstack_visual_embeds is not None:
+                visual_embed = None
+                if isinstance(deepstack_visual_embeds, dict):
+                    visual_embed = deepstack_visual_embeds.get(layer_idx)
+                elif layer_idx < len(deepstack_visual_embeds):
+                    visual_embed = deepstack_visual_embeds[layer_idx]
+
+                if visual_embed is not None:
+                    x = self._deepstack_process(
+                        x,
+                        visual_pos_masks,
+                        visual_embed,
+                    )
         x = self.norm(x)
         return x
 
@@ -270,14 +290,12 @@ class Qwen3VL(nn.Module):
         self.config = config
         self.vision_config = vision_config
 
-        # Wrap in a model container to match checkpoint structure
         self.model = nn.Module()
         self.model.language_model = Model(config)
-        self.model.lm_head = None
+        self.lm_head = None
         if not config.tie_word_embeddings:
-            self.model.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
+            self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
 
-        # Add vision encoder if config provided
         if vision_config is not None:
             self.model.visual = VisionEncoder(vision_config)
 
@@ -287,27 +305,20 @@ class Qwen3VL(nn.Module):
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Get input embeddings
         input_embeds = self.model.language_model.embed_tokens(input_ids)
 
+        # Process vision inputs if provided
         visual_pos_masks = None
         deepstack_visual_embeds = None
-
-        # Process vision inputs if provided
         if pixels is not None and self.vision_config is not None:
-            # Convert pixels to same dtype as model weights
             pixels = pixels.to(input_embeds.dtype)
-
-            # Encode images through vision encoder
             image_embeds, deepstack_visual_embeds = self.model.visual(
                 pixels=pixels, d_image=d_image
             )
 
-            # Create mask for image_pad tokens (token_id: 151655)
-            image_pad_mask = input_ids == 151655
+            image_pad_token = getattr(self.config, "image_token_id", 151655)
+            image_pad_mask = input_ids == image_pad_token
             visual_pos_masks = image_pad_mask
-
-            # Replace image_pad embeddings with actual image embeddings
             image_pad_mask_expanded = image_pad_mask.unsqueeze(-1).expand_as(
                 input_embeds
             )
@@ -315,10 +326,17 @@ class Qwen3VL(nn.Module):
                 image_pad_mask_expanded, image_embeds
             )
 
-        # Generate position IDs for MRoPE
+            if deepstack_visual_embeds:
+                deepstack_visual_embeds = {
+                    layer_idx: embed
+                    for layer_idx, embed in zip(
+                        self.vision_config.deepstack_visual_indexes,
+                        deepstack_visual_embeds,
+                    )
+                }
+
         position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
 
-        # Forward through language model
         x = self.model.language_model(
             x=input_embeds,
             position_ids=position_ids,
@@ -326,11 +344,11 @@ class Qwen3VL(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
-        # Generate logits
-        if self.model.lm_head is None:
-            logits = torch.matmul(x, self.model.language_model.embed_tokens.weight.T)
-        else:
-            logits = self.model.lm_head(x)
+        logits = (
+            x @ self.model.language_model.embed_tokens.weight.T
+            if self.lm_head is None
+            else self.lm_head(x)
+        )
 
         return logits
 
@@ -401,224 +419,65 @@ class Qwen3VL(nn.Module):
             position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
             return position_ids
 
-        # Multimodal case: generate 3D position IDs for MRoPE
-        # Token IDs: vision_start=151652, image_pad=151655, vision_end=151653
-        vision_start_id = 151652
-        vision_end_id = 151653
+        vision_start_id = getattr(self.config, "vision_start_token_id", 151652)
+        vision_end_id = getattr(self.config, "vision_end_token_id", 151653)
+        image_token_id = getattr(self.config, "image_token_id", 151655)
         spatial_merge_size = self.vision_config.spatial_merge_size
 
-        # Initialize position IDs with text positions
         position_ids = torch.zeros(3, B, T, dtype=torch.long, device=device)
 
-        # For each sample in batch
         for b in range(B):
             seq = input_ids[b]
             text_counter = 0
             image_counter = 0
+            i = 0
 
-            for i in range(T):
+            while i < T:
                 token_id = seq[i].item()
 
                 if token_id == vision_start_id:
-                    # Vision start token gets the current text position
                     position_ids[:, b, i] = text_counter
                     text_counter += 1
+                    i += 1
+                    continue
 
-                elif token_id == vision_end_id:
-                    # Vision end token gets the current text position
+                if token_id == vision_end_id:
                     position_ids[:, b, i] = text_counter
                     text_counter += 1
                     image_counter += 1
+                    i += 1
+                    continue
 
-                elif i > 0 and seq[i - 1] == vision_start_id:
-                    # First token after vision_start: beginning of image tokens
-                    # Calculate 3D positions [t, h, w] for this image
+                if token_id == image_token_id:
+                    if d_image is None:
+                        raise ValueError(
+                            "image_grid_thw must be provided for image tokens."
+                        )
                     t_img, h_img, w_img = d_image[image_counter]
-                    h_img = h_img // spatial_merge_size
-                    w_img = w_img // spatial_merge_size
-
-                    # Calculate how many image_pad tokens for this image
+                    h_img = (h_img // spatial_merge_size).item()
+                    w_img = (w_img // spatial_merge_size).item()
+                    t_img = t_img.item()
                     image_tokens = t_img * h_img * w_img
+                    base = text_counter
 
-                    # Generate 3D position IDs
                     for img_idx in range(image_tokens):
                         if i + img_idx >= T:
                             break
-
                         t_pos = img_idx // (h_img * w_img)
                         remaining = img_idx % (h_img * w_img)
                         h_pos = remaining // w_img
                         w_pos = remaining % w_img
 
-                        position_ids[0, b, i + img_idx] = t_pos
-                        position_ids[1, b, i + img_idx] = h_pos
-                        position_ids[2, b, i + img_idx] = w_pos
+                        position_ids[0, b, i + img_idx] = base
+                        position_ids[1, b, i + img_idx] = h_pos + base
+                        position_ids[2, b, i + img_idx] = w_pos + base
 
-                elif i > 0 and any(
-                    seq[j] == vision_start_id for j in range(max(0, i - 1000), i)
-                ):
-                    # We're inside an image region, skip (already handled above)
+                    i += image_tokens
+                    text_counter = base + 1
                     continue
 
-                else:
-                    # Regular text token
-                    position_ids[:, b, i] = text_counter
-                    text_counter += 1
+                position_ids[:, b, i] = text_counter
+                text_counter += 1
+                i += 1
 
         return position_ids
-
-
-# class Qwen3(nn.Module):
-#     def __init__(self, config: ModelConfig):
-#         super().__init__()
-#         self.config = config
-#         self.model = Qwen3Dense(config)
-
-#         # Match lm_head dtype with embeddings for checkpoints stored in float32
-#         if self.model.lm_head is not None:
-#             target_dtype = self.model.language_model.embed_tokens.weight.dtype
-#             self.model.lm_head = self.model.lm_head.to(target_dtype)
-
-#     def forward(self, input_ids: torch.Tensor):
-#         x = self.model(input_ids)
-#         return x
-
-#     def generate(
-#         self,
-#         input_ids: torch.Tensor,
-#         max_new_tokens: int = 1,
-#         stop_tokens: list = None,
-#     ):
-#         if stop_tokens is None:
-#             # <|im_end|>, <|im_start|>, <|endoftext|>
-#             stop_tokens = [151645, 151644, 151643]
-
-#         self.eval()
-#         with torch.no_grad():
-#             for _ in range(max_new_tokens):
-#                 logits = self.forward(input_ids=input_ids)
-#                 last_logits = logits[:, -1, :]
-#                 probs = F.softmax(last_logits, dim=-1)
-#                 next_token = probs.argmax(dim=-1, keepdim=True)
-#                 input_ids = torch.cat([input_ids, next_token], dim=1)
-
-#                 # Check if we hit a stop token
-#                 if next_token.item() in stop_tokens:
-#                     break
-
-#         return input_ids
-
-#     @classmethod
-#     def from_pretrained(cls, weights_path: str, device_map: str = "auto"):
-#         model_path = Path(weights_path)
-
-#         with open(model_path / "config.json", "r") as f:
-#             hf_config = json.load(f)
-#         config = ModelConfig.from_pretrained(hf_config)
-
-#         model = cls(config)
-
-#         # Use accelerate to load weights efficiently without loading all to RAM
-#         model = load_checkpoint_and_dispatch(
-#             model,
-#             checkpoint=str(model_path),
-#             device_map=device_map,
-#             no_split_module_classes=["DenseBlock"],
-#             dtype=torch.bfloat16,
-#         )
-
-#         return model
-
-
-# class MoEModel(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.embed_tokens = nn.Embedding(config.n_vocab, config.n_embed)
-#         self.rotary_emb = RotaryEmbedding(config)
-
-#         # Use Qwen3MoeBlock with proper attention and MoE
-#         self.layers = nn.ModuleList(MoEBlock(config) for _ in range(config.n_layer))
-#         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
-
-#         # Store config for convenience
-#         self.config = config
-
-#     def forward(self, x, position_ids):
-#         cos, sin = self.rotary_emb(x, position_ids)
-#         for layer in self.layers:
-#             x = layer(x, cos, sin)
-#         x = self.norm(x)
-#         return x
-
-
-# class Qwen3MoE(nn.Module):
-#     def __init__(self, config: ModelConfig):
-#         super().__init__()
-#         self.config = config
-#         self.model = MoEModel(config)
-
-#         self.lm_head = None
-#         if not config.tie_word_embeddings:
-#             self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
-
-#     def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-#         B, T = input_ids.shape
-#         device = input_ids.device
-#         position_ids = torch.arange(T, dtype=torch.long, device=device)
-#         position_ids = position_ids.unsqueeze(0).expand(B, -1)
-#         return position_ids
-
-#     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-#         target_dtype = self.model.embed_tokens.weight.dtype
-#         x = self.model.embed_tokens(input_ids).to(target_dtype)
-#         position_ids = self._get_position_ids(input_ids)
-#         x = self.model(x=x, position_ids=position_ids)
-
-#         x = x.to(target_dtype)
-#         if self.lm_head is None:
-#             logits = torch.matmul(x, self.model.embed_tokens.weight.T.to(target_dtype))
-#         else:
-#             logits = self.lm_head(x)
-#         return logits
-
-#     def generate(
-#         self,
-#         input_ids: torch.Tensor,
-#         max_new_tokens: int = 1,
-#         stop_tokens: list = None,
-#         stream: bool = False,
-#     ):
-#         if stop_tokens is None:
-#             # <|im_end|>, <|im_start|>, <|endoftext|>
-#             stop_tokens = [151645, 151644, 151643]
-
-#         self.eval()
-#         with torch.no_grad():
-#             for _ in range(max_new_tokens):
-#                 logits = self.forward(input_ids=input_ids)
-#                 last_logits = logits[:, -1, :]
-#                 probs = F.softmax(last_logits, dim=-1)
-#                 next_token = probs.argmax(dim=-1, keepdim=True)
-#                 input_ids = torch.cat([input_ids, next_token], dim=1)
-
-#                 # If streaming, yield the new token
-#                 if stream:
-#                     yield next_token.item()
-
-#                 # Check if we hit a stop token
-#                 if next_token.item() in stop_tokens:
-#                     break
-
-#         # If not streaming, return the full input_ids
-#         if not stream:
-#             return input_ids
-
-#     @classmethod
-#     def get_config_class(cls):
-#         return ModelConfig
-
-#     @classmethod
-#     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
-#         from .util import load_pretrained_model
-
-#         return load_pretrained_model(cls, repo_id, device_map=device_map)
