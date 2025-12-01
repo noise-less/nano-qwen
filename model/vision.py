@@ -322,7 +322,7 @@ class VisionEncoder(nn.Module):
 
     def forward(
         self, pixels: torch.Tensor, d_image: torch.Tensor
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         hidden_states = self.patch_embed(pixels)
 
         # Add learnable position embeddings
@@ -335,15 +335,15 @@ class VisionEncoder(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        deepstack_feature_lists = []
+        deepstack_features: dict[int, torch.Tensor] = {}
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
             )
             if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[
-                    self.deepstack_visual_indexes.index(layer_num)
-                ](hidden_states)
-                deepstack_feature_lists.append(deepstack_feature)
+                ds_idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_features[layer_num] = self.deepstack_merger_list[ds_idx](
+                    hidden_states
+                )
 
-        return self.merger(hidden_states), deepstack_feature_lists
+        return self.merger(hidden_states), deepstack_features

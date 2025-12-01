@@ -1,13 +1,12 @@
 import json
+from pathlib import Path
+from typing import Optional, Tuple
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
-from pathlib import Path
-from dataclasses import dataclass
-
 from accelerate import load_checkpoint_and_dispatch
-
 from .vision import VisionEncoder, VisionConfig
 
 
@@ -78,7 +77,7 @@ class RotaryEmbedding(nn.Module):
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """[TTT...HHH...WWW] -> [THWTHWTHW...TT]"""
-        freqs_t = freqs[0]  # Start with temporal dimension
+        freqs_t = freqs[0]  # start with temporal dimension
         for dim, offset in enumerate((1, 2), start=1):  # H, W
             length = mrope_section[dim] * 3
             idx = slice(offset, length, 3)
@@ -198,7 +197,7 @@ class MoEMLP(nn.Module):
         self.experts = MoEExperts(config)
 
     def forward(self, x):
-        bsz, seq_len, _ = x.shape
+        B, T, _ = x.shape
         hidden = x.reshape(-1, self.hidden_size)
 
         router_logits = self.gate(hidden)
@@ -210,11 +209,10 @@ class MoEMLP(nn.Module):
         routed.scatter_(1, topk_indices, topk_weights)
         routed = routed / (routed.sum(dim=-1, keepdim=True) + 1e-9)
         routed = routed.to(hidden.dtype)
-
         expert_out = self.experts(hidden, routed)
-        combined = expert_out.view(bsz, seq_len, self.hidden_size)
+        combined = expert_out.view(B, T, self.hidden_size)
 
-        return combined, router_logits.to(hidden.dtype)
+        return combined
 
 
 class Block(nn.Module):
@@ -228,10 +226,7 @@ class Block(nn.Module):
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        mlp_out = self.mlp(self.post_attention_layernorm(x))
-        if isinstance(mlp_out, tuple):
-            mlp_out = mlp_out[0]
-        x = x + mlp_out
+        x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
@@ -245,41 +240,29 @@ class Model(nn.Module):
         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
     def forward(
-        self, x, position_ids, visual_pos_masks=None, deepstack_visual_embeds=None
-    ):
-        # x can be either token IDs (int) or embeddings (float)
-        if x.dtype in (torch.long, torch.int):
-            x = self.embed_tokens(x)
+        self,
+        x: torch.Tensor,
+        v: Optional[torch.Tensor] = None,
+        v_d: Optional[dict[int, torch.Tensor]] = None,
+        v_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if v is not None and v_mask is not None:
+            x = x.clone()
+            x[v_mask] = v
 
         cos, sin = self.rotary_emb(x, position_ids)
+
         for layer_idx, layer in enumerate(self.layers):
             x = layer(x, cos, sin)
-            # Add deepstack visual features residually at early layers
-            if deepstack_visual_embeds is not None:
-                visual_embed = None
-                if isinstance(deepstack_visual_embeds, dict):
-                    visual_embed = deepstack_visual_embeds.get(layer_idx)
-                elif layer_idx < len(deepstack_visual_embeds):
-                    visual_embed = deepstack_visual_embeds[layer_idx]
-
+            if v_d and v_mask is not None:
+                visual_embed = v_d.get(layer_idx)
                 if visual_embed is not None:
-                    x = self._deepstack_process(
-                        x,
-                        visual_pos_masks,
-                        visual_embed,
-                    )
+                    x = x.clone()
+                    x[v_mask] = x[v_mask] + visual_embed
+
         x = self.norm(x)
         return x
-
-    def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
-        """Add visual features residually to language model hidden states."""
-        if visual_pos_masks is None:
-            return hidden_states
-        hidden_states = hidden_states.clone()
-        hidden_states[visual_pos_masks, :] = (
-            hidden_states[visual_pos_masks, :] + visual_embeds
-        )
-        return hidden_states
 
 
 class Qwen3VL(nn.Module):
@@ -305,51 +288,29 @@ class Qwen3VL(nn.Module):
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        input_embeds = self.model.language_model.embed_tokens(input_ids)
+        x = self.model.language_model.embed_tokens(input_ids)
 
-        # Process vision inputs if provided
-        visual_pos_masks = None
-        deepstack_visual_embeds = None
-        if pixels is not None and self.vision_config is not None:
-            pixels = pixels.to(input_embeds.dtype)
-            image_embeds, deepstack_visual_embeds = self.model.visual(
-                pixels=pixels, d_image=d_image
-            )
+        v = None
+        v_d = None
+        v_mask = None
+        if pixels is not None:
+            pixels = pixels.to(x.dtype)
+            v, v_d = self.model.visual(pixels=pixels, d_image=d_image)
+            v = v.to(x.dtype)
+            v_d = {idx: embed.to(x.dtype) for idx, embed in v_d.items()}
 
             image_pad_token = getattr(self.config, "image_token_id", 151655)
-            image_pad_mask = input_ids == image_pad_token
-            visual_pos_masks = image_pad_mask
-            image_pad_mask_expanded = image_pad_mask.unsqueeze(-1).expand_as(
-                input_embeds
-            )
-            input_embeds = input_embeds.masked_scatter(
-                image_pad_mask_expanded, image_embeds
-            )
-
-            if deepstack_visual_embeds:
-                deepstack_visual_embeds = {
-                    layer_idx: embed
-                    for layer_idx, embed in zip(
-                        self.vision_config.deepstack_visual_indexes,
-                        deepstack_visual_embeds,
-                    )
-                }
+            v_mask = input_ids == image_pad_token
 
         position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
-
         x = self.model.language_model(
-            x=input_embeds,
-            position_ids=position_ids,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            x=x, v=v, v_d=v_d, v_mask=v_mask, position_ids=position_ids
         )
-
         logits = (
             x @ self.model.language_model.embed_tokens.weight.T
             if self.lm_head is None
             else self.lm_head(x)
         )
-
         return logits
 
     def generate(
@@ -375,11 +336,75 @@ class Qwen3VL(nn.Module):
                 next_token = probs.argmax(dim=-1, keepdim=True)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
-                # Check if we hit a stop token
                 if next_token.item() in stop_tokens:
                     break
 
         return input_ids
+
+    def _get_position_ids(
+        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        B, T = input_ids.shape
+        image_pad_token = getattr(self.config, "image_token_id", 151655)
+
+        # text-only case: sequential position IDs repeated 3 times
+        if d_image is None:
+            position_ids = torch.arange(T, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
+            return position_ids
+
+        # text + vision case: 3D position IDs
+        position_ids = torch.zeros(3, B, T, dtype=torch.long, device=input_ids.device)
+        for batch_idx in range(B):
+            seq = input_ids[batch_idx]
+            text_idx, image_idx, seq_idx = 0, 0, 0
+            while seq_idx < T:
+                token_id = seq[seq_idx].item()
+                if token_id == image_pad_token:
+                    # start of an vision block (image(s))
+                    text_idx, image_idx, seq_idx = self._emit_image_block(
+                        position_ids=position_ids,
+                        batch_idx=batch_idx,
+                        seq_idx=seq_idx,
+                        text_idx=text_idx,
+                        image_idx=image_idx,
+                        d_image=d_image,
+                    )
+                else:
+                    # treat as regular text token
+                    position_ids[:, batch_idx, seq_idx] = text_idx
+                    text_idx, image_idx, seq_idx = text_idx + 1, image_idx, seq_idx + 1
+
+        return position_ids
+
+    def _emit_image_block(
+        self,
+        position_ids: torch.Tensor,
+        batch_idx: int,
+        seq_idx: int,
+        text_idx: int,
+        image_idx: int,
+        d_image: torch.Tensor,
+        spatial_merge_size: int = 2,
+    ) -> Tuple[int, int, int]:
+        t_img, h_img, w_img = d_image[image_idx]
+        t_img = int(t_img.item())
+        h_img = int((h_img // spatial_merge_size).item())
+        w_img = int((w_img // spatial_merge_size).item())
+
+        image_token_count = h_img * w_img
+        video_token_count = t_img * image_token_count
+        for offset in range(video_token_count):
+            target_idx = seq_idx + offset
+            remaining = offset % image_token_count
+            h_pos = remaining // w_img
+            w_pos = remaining % w_img
+
+            position_ids[:, batch_idx, target_idx] = text_idx
+            position_ids[1, batch_idx, target_idx] = text_idx + h_pos
+            position_ids[2, batch_idx, target_idx] = text_idx + w_pos
+
+        return text_idx + 1, image_idx + 1, seq_idx + video_token_count
 
     @classmethod
     def from_pretrained(cls, weights_path: str, device_map: str = "auto"):
@@ -406,78 +431,3 @@ class Qwen3VL(nn.Module):
         )
 
         return model
-
-    def _get_position_ids(
-        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        B, T = input_ids.shape
-        device = input_ids.device
-
-        # Text-only case: simple sequential position IDs
-        if d_image is None:
-            position_ids = torch.arange(T, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
-            return position_ids
-
-        vision_start_id = getattr(self.config, "vision_start_token_id", 151652)
-        vision_end_id = getattr(self.config, "vision_end_token_id", 151653)
-        image_token_id = getattr(self.config, "image_token_id", 151655)
-        spatial_merge_size = self.vision_config.spatial_merge_size
-
-        position_ids = torch.zeros(3, B, T, dtype=torch.long, device=device)
-
-        for b in range(B):
-            seq = input_ids[b]
-            text_counter = 0
-            image_counter = 0
-            i = 0
-
-            while i < T:
-                token_id = seq[i].item()
-
-                if token_id == vision_start_id:
-                    position_ids[:, b, i] = text_counter
-                    text_counter += 1
-                    i += 1
-                    continue
-
-                if token_id == vision_end_id:
-                    position_ids[:, b, i] = text_counter
-                    text_counter += 1
-                    image_counter += 1
-                    i += 1
-                    continue
-
-                if token_id == image_token_id:
-                    if d_image is None:
-                        raise ValueError(
-                            "image_grid_thw must be provided for image tokens."
-                        )
-                    t_img, h_img, w_img = d_image[image_counter]
-                    h_img = (h_img // spatial_merge_size).item()
-                    w_img = (w_img // spatial_merge_size).item()
-                    t_img = t_img.item()
-                    image_tokens = t_img * h_img * w_img
-                    base = text_counter
-
-                    for img_idx in range(image_tokens):
-                        if i + img_idx >= T:
-                            break
-                        t_pos = img_idx // (h_img * w_img)
-                        remaining = img_idx % (h_img * w_img)
-                        h_pos = remaining // w_img
-                        w_pos = remaining % w_img
-
-                        position_ids[0, b, i + img_idx] = base
-                        position_ids[1, b, i + img_idx] = h_pos + base
-                        position_ids[2, b, i + img_idx] = w_pos + base
-
-                    i += image_tokens
-                    text_counter = base + 1
-                    continue
-
-                position_ids[:, b, i] = text_counter
-                text_counter += 1
-                i += 1
-
-        return position_ids

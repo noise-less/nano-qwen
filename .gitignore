@@ -9,11 +9,11 @@ playground_old.ipynb
 cache
 .cache
 config
-venv
+.venv
 test.py
 textbook/
 .env
 .claude/
-transformers/
+# transformers/
 tokenizers/
 runs/
