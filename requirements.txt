@@ -6,6 +6,7 @@ huggingface_hub==0.31.1
 accelerate==1.6.0
 pillow==11.2.1
 matplotlib==3.10.3
-prompt-toolkit==3.0.52
+typer==0.15.3
+rich==14.0.0
+questionary==2.0.1
 lightning==2.5.3
-pytest==8.4.2

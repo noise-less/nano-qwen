@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from PIL import Image
 from io import BytesIO
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
 
@@ -63,7 +63,10 @@ class Processor:
 
     # Turn openai harmony style messages into model input tensors.
     def __call__(
-        self, messages: List[dict], add_generation_prompt: bool = False
+        self,
+        messages: List[dict],
+        add_generation_prompt: bool = False,
+        device: Optional[torch.device] = None,
     ) -> dict:
         pixels_list = []
         d_image_list = []
@@ -112,11 +115,18 @@ class Processor:
             pixels = None
             d_image = None
 
-        return {
+        output = {
             "input_ids": input_ids,
             "pixels": pixels,
             "d_image": d_image,
         }
+        if device is not None:
+            output["input_ids"] = output["input_ids"].to(device)
+            if output["pixels"] is not None:
+                output["pixels"] = output["pixels"].to(device)
+            if output["d_image"] is not None:
+                output["d_image"] = output["d_image"].to(device)
+        return output
 
     def _render_content(
         self, content: dict, pixels_list: list, d_image_list: list
@@ -124,12 +134,19 @@ class Processor:
         if content["type"] == "text":
             return content["text"]
         elif content["type"] == "image":
-            # Fetch image from URL or local path
-            if "url" not in content:
+            image = None
+            if "image" in content:
+                image_field = content["image"]
+                if isinstance(image_field, Image.Image):
+                    image = image_field
+                else:
+                    image = Image.open(image_field)
+            elif "url" in content:
+                image = self._fetch_img_through_url(content["url"])
+            else:
                 raise ValueError(
-                    f"Image content must have 'url' field with URL or local path, got {content}"
+                    f"Image content must have 'image' or 'url' field, got {content}"
                 )
-            image = self._fetch_img_through_url(content["url"])
 
             patches, grid_t, grid_h, grid_w = self._process_image(image)
 

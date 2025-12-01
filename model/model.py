@@ -237,7 +237,9 @@ class Model(nn.Module):
                 # deepstack process
                 vision_residual = vision_residuals.get(layer_idx)
                 if vision_residual is not None:
-                    input_embed[vision_mask] = input_embed[vision_mask] + vision_residual
+                    input_embed[vision_mask] = (
+                        input_embed[vision_mask] + vision_residual
+                    )
 
         input_embed = self.norm(input_embed)
         return input_embed
@@ -294,34 +296,6 @@ class Qwen3VL(nn.Module):
             else self.lm_head(output)
         )
         return logits
-
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        pixels: Optional[torch.Tensor] = None,
-        d_image: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 1,
-        stop_tokens: list = None,
-    ):
-        if stop_tokens is None:
-            # <|im_end|>, <|im_start|>, <|endoftext|>
-            stop_tokens = [151645, 151644, 151643]
-
-        self.eval()
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                logits = self.forward(
-                    input_ids=input_ids, pixels=pixels, d_image=d_image
-                )
-                last_logits = logits[:, -1, :]
-                probs = F.softmax(last_logits, dim=-1)
-                next_token = probs.argmax(dim=-1, keepdim=True)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-
-                if next_token.item() in stop_tokens:
-                    break
-
-        return input_ids
 
     def _get_position_ids(
         self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
@@ -439,3 +413,72 @@ class Qwen3VL(nn.Module):
         )
 
         return model
+
+    def _generate_core(
+        self,
+        input_ids: torch.Tensor,
+        pixels: Optional[torch.Tensor],
+        d_image: Optional[torch.Tensor],
+        max_new_tokens: int,
+        stop_tokens: Optional[list],
+    ):
+        if stop_tokens is None:
+            # <|im_end|>, <|im_start|>, <|endoftext|>
+            stop_tokens = [151645, 151644, 151643]
+
+        self.eval()
+        generated_ids = input_ids
+
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                logits = self.forward(
+                    input_ids=generated_ids, pixels=pixels, d_image=d_image
+                )
+                last_logits = logits[:, -1, :]
+                probs = F.softmax(last_logits, dim=-1)
+                next_token = probs.argmax(dim=-1, keepdim=True)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+                token_id = next_token[0].item()
+                yield token_id, generated_ids
+
+                if token_id in stop_tokens:
+                    break
+
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        pixels: Optional[torch.Tensor] = None,
+        d_image: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+    ):
+        generated_ids = input_ids
+
+        for _, generated_ids in self._generate_core(
+            input_ids=input_ids,
+            pixels=pixels,
+            d_image=d_image,
+            max_new_tokens=max_new_tokens,
+            stop_tokens=stop_tokens,
+        ):
+            pass
+
+        return generated_ids
+
+    def generate_stream(
+        self,
+        input_ids: torch.Tensor,
+        pixels: Optional[torch.Tensor] = None,
+        d_image: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+    ):
+        for token_id, _ in self._generate_core(
+            input_ids=input_ids,
+            pixels=pixels,
+            d_image=d_image,
+            max_new_tokens=max_new_tokens,
+            stop_tokens=stop_tokens,
+        ):
+            yield token_id
