@@ -1,22 +1,19 @@
 import os
-import re
+import time
+from typing import List, Dict
+
 import torch
+from prompt_toolkit import PromptSession, print_formatted_text, HTML
+from prompt_toolkit.shortcuts import choice
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.cursor_shapes import CursorShape
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
+from prompt_toolkit.filters import is_done
+from transformers import AutoProcessor
+from huggingface_hub import snapshot_download
 
-import typer
-import questionary
-from questionary import Choice, Style
-from rich.console import Console
-from rich.text import Text
-
-# Disable HuggingFace progress bars globally
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["HF_HUB_VERBOSITY"] = "error"
-os.environ["ACCELERATE_DISABLE_RICH"] = "1"
-
-from model.processor import Processor
-from model.qwen2_5_vl import Qwen2VL
-from model.qwen3 import Qwen3Dense, Qwen3MoE
-from model.qwen3v import Qwen3V
+from model.model import Qwen3VL
 
 ASCII_LOGO = """
 ██╗    ████████╗██╗███╗   ██╗██╗   ██╗    ██████╗ ██╗    ██╗███████╗███╗   ██╗
@@ -35,298 +32,238 @@ Tips:
 2. /exit or Ctrl+C to exit.
 """
 
-HELP_TEXT = """
-Available commands:
-/help - Show this help message
-/exit - Exit the application
+ALL_MODELS = [
+    "Qwen/Qwen3-VL-2B-Instruct",
+    "Qwen/Qwen3-VL-2B-Thinking",
+    "Qwen/Qwen3-VL-4B-Instruct",
+    "Qwen/Qwen3-VL-4B-Thinking",
+    "Qwen/Qwen3-VL-8B-Instruct",
+    "Qwen/Qwen3-VL-8B-Thinking",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "Qwen/Qwen3-VL-30B-A3B-Thinking",
+    "Qwen/Qwen3-VL-32B-Instruct",
+    "Qwen/Qwen3-VL-32B-Thinking",
+]
 
-For Qwen2.5-VL and Qwen3V models, use @relative/path/to/image.jpg to include images in your messages.
+
+_session = PromptSession()
+
+
+def log_help_message():
+    log_text(
+        """
+<b>Commands:</b>
+  <b>/help</b>    Show this message again
+  <b>/switch</b>  Change to a different model
+  <b>/reset</b>   Clear the current conversation history
+  <b>/exit</b>    Quit the CLI
 """
-
-# Mapping of all models: generation -> variant -> HF repo id
-ALL_MODELS = {
-    "Qwen3": {
-        "Qwen3-0.6B": "Qwen/Qwen3-0.6B",
-        "Qwen3-1.7B": "Qwen/Qwen3-1.7B",
-        "Qwen3-4B": "Qwen/Qwen3-4B",
-        "Qwen3-8B": "Qwen/Qwen3-8B",
-        "Qwen3-14B": "Qwen/Qwen3-14B",
-        "Qwen3-32B": "Qwen/Qwen3-32B",
-        "Qwen3-4B-Instruct-2507": "Qwen/Qwen3-4B-Instruct-2507",
-        "Qwen3-30B-A3B-Instruct-2507": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "Qwen3-235B-A22B-Instruct-2507": "Qwen/Qwen3-235B-A22B-Instruct-2507",
-        "Qwen3-4B-Thinking-2507": "Qwen/Qwen3-4B-Thinking-2507",
-        "Qwen3-30B-A3B-Thinking-2507": "Qwen/Qwen3-30B-A3B-Thinking-2507",
-        "Qwen3-235B-A22B-Thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
-    },
-    "Qwen2.5-VL": {
-        "Qwen2.5-VL-3B-Instruct": "Qwen/Qwen2.5-VL-3B-Instruct",
-        "Qwen2.5-VL-7B-Instruct": "Qwen/Qwen2.5-VL-7B-Instruct",
-        "Qwen2.5-VL-32B-Instruct": "Qwen/Qwen2.5-VL-32B-Instruct",
-        "Qwen2.5-VL-72B-Instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
-    },
-    "Qwen3V": {
-        "Qwen3V-4B-Preview": "Qwen3V-4B-Preview",
-    },
-}
-
-REPO_ID_TO_MODEL_CLASS = {
-    "Qwen/Qwen2.5-VL-3B-Instruct": Qwen2VL,
-    "Qwen/Qwen2.5-VL-7B-Instruct": Qwen2VL,
-    "Qwen/Qwen2.5-VL-32B-Instruct": Qwen2VL,
-    "Qwen/Qwen2.5-VL-72B-Instruct": Qwen2VL,
-    "Qwen/Qwen3-0.6B": Qwen3MoE,
-    "Qwen/Qwen3-1.7B": Qwen3Dense,
-    "Qwen/Qwen3-4B": Qwen3MoE,
-    "Qwen/Qwen3-8B": Qwen3Dense,
-    "Qwen/Qwen3-14B": Qwen3Dense,
-    "Qwen/Qwen3-32B": Qwen3Dense,
-    "Qwen/Qwen3-4B-Instruct-2507": Qwen3MoE,
-    "Qwen/Qwen3-30B-A3B-Instruct-2507": Qwen3MoE,
-    "Qwen/Qwen3-235B-A22B-Instruct-2507": Qwen3MoE,
-    "Qwen/Qwen3-4B-Thinking-2507": Qwen3MoE,
-    "Qwen/Qwen3-30B-A3B-Thinking-2507": Qwen3MoE,
-    "Qwen/Qwen3-235B-A22B-Thinking-2507": Qwen3MoE,
-    "Qwen3V-4B-Preview": Qwen3V,
-}
-
-STYLE = Style(
-    [
-        ("question", "bold"),
-        ("selected", "fg:#000000 bg:#face0a bold"),
-        ("highlighted", "fg:#face0a bold"),
-        ("instruction", "fg:#888888"),
-        ("separator", "fg:#666666"),
-        ("text", ""),
-        ("qmark", "fg:#face0a"),
-    ]
-)
-
-console = Console(highlight=False)
-app = typer.Typer(add_completion=False)
+    )
 
 
-def parse_user_input(text):
-    """Convert @path/to/image.jpg syntax to standard messages format."""
-    image_pattern = r"@([^\s]+\.(?:jpg|jpeg|png|gif|webp))"
-    matches = list(re.finditer(image_pattern, text, re.IGNORECASE))
-
-    if not matches:
-        # No images, return simple text message
-        return [{"role": "user", "content": text}]
-
-    # Build content list with text and images
-    content = []
-    last_end = 0
-
-    for match in matches:
-        if match.start() > last_end:
-            text_part = text[last_end : match.start()].strip()
-            if text_part:
-                content.append({"type": "text", "text": text_part})
-
-        # Add image
-        image_path = match.group(1)
-        if os.path.exists(image_path):
-            content.append({"type": "image", "image": image_path})
-            console.print(f"✓ Found image: {image_path}", style="green")
-        else:
-            console.print(f"Warning: Image not found: {image_path}", style="yellow")
-
-        last_end = match.end()
-
-    # Add remaining text
-    if last_end < len(text):
-        remaining_text = text[last_end:].strip()
-        if remaining_text:
-            content.append({"type": "text", "text": remaining_text})
-
-    return [{"role": "user", "content": content}]
+def log_startup_banner():
+    log_text(ASCII_LOGO)
+    log_text(STARTING_HELP_TEXT)
+    log_help_message()
 
 
-def generate_local_response(
-    messages, model, processor, model_generation, max_tokens=2048, stream=False
-):
-    """Generate response using local model."""
-    inputs = processor(messages)
-
-    device = next(model.parameters()).device
-    inputs["input_ids"] = inputs["input_ids"].to(device)
-    if inputs["pixels"] is not None:
-        inputs["pixels"] = inputs["pixels"].to(device)
-    if inputs["d_image"] is not None:
-        inputs["d_image"] = inputs["d_image"].to(device)
-
-    stop_tokens = [151645, 151644, 151643]  # <|im_end|>, <|im_start|>, <|endoftext|>
-
-    with torch.no_grad():
-        if model_generation == "Qwen2.5-VL" or model_generation == "Qwen3V":
-            if inputs["pixels"] is not None:
-                generation = model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixels=inputs["pixels"],
-                    d_image=inputs["d_image"],
-                    max_new_tokens=max_tokens,
-                    stop_tokens=stop_tokens,
-                    stream=stream,
-                )
-            else:
-                generation = model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixels=None,
-                    d_image=None,
-                    max_new_tokens=max_tokens,
-                    stop_tokens=stop_tokens,
-                    stream=stream,
-                )
-        else:
-            generation = model.generate(
-                input_ids=inputs["input_ids"],
-                max_new_tokens=max_tokens,
-                stop_tokens=stop_tokens,
-                stream=stream,
-            )
-
-    if stream:
-        for token_id in generation:
-            token_text = processor.tokenizer.decode([token_id])
-            yield token_text
-    else:
-        input_length = inputs["input_ids"].shape[1]
-        response_ids = generation[:, input_length:]
-        response = processor.tokenizer.decode(response_ids[0].tolist())
-        return response
+def pick_model() -> str:
+    model = prompt_user_choice("Select a Qwen3-VL model", ALL_MODELS + ["Exit"])
+    if model == "Exit":
+        return ""
+    return model
 
 
-@app.command()
+def load_model_and_processor(repo_id: str) -> tuple[Qwen3VL, AutoProcessor, str]:
+    log_text(f"<i>Downloading weights for <b>{repo_id}</b>...</i>")
+    weights_path = snapshot_download(repo_id=repo_id, cache_dir=".cache")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log_text(f"<i>Loading model on <b>{device}</b>...</i>")
+    model = Qwen3VL.from_pretrained(weights_path=weights_path, device_map="auto")
+    model = model.to(device)
+    processor = AutoProcessor.from_pretrained(repo_id)
+    return model, processor, device
+
+
+def build_prompt_message(content: str) -> Dict:
+    return {"role": "user", "content": [{"type": "text", "text": content}]}
+
+
+def build_assistant_message(content: str) -> Dict:
+    return {"role": "assistant", "content": [{"type": "text", "text": content}]}
+
+
+def generate_completion(
+    messages: List[Dict],
+    model: Qwen3VL,
+    processor: AutoProcessor,
+    device: str,
+    max_new_tokens: int,
+) -> str:
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+
+    inputs = inputs.to(device)
+    output_ids = model.generate(
+        input_ids=inputs.input_ids,
+        max_new_tokens=max_new_tokens,
+    )
+    decoded = processor.batch_decode(
+        output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    return decoded[0]
+
+
+def prompt_user_query(keywords: list[str] = [], default: str = "") -> str:
+    word_completer = WordCompleter(keywords, ignore_case=True)
+    if not keywords:
+        word_completer = None
+
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    def _(event):
+        """Submit on Enter"""
+        event.current_buffer.validate_and_handle()
+
+    @bindings.add("c-j")
+    def _(event):
+        """Newline on Ctrl+J"""
+        event.current_buffer.insert_text("\n")
+
+    print_formatted_text("")
+    user_input = _session.prompt(
+        HTML("<b>></b> "),
+        completer=word_completer,
+        cursor=CursorShape.BLINKING_BLOCK,
+        multiline=True,
+        prompt_continuation=lambda width, _, __: " " * width,
+        key_bindings=bindings,
+        default=default,
+    )
+    return user_input.strip()
+
+
+def prompt_user_choice(prompt: str, options: list[str]) -> str:
+    style = Style.from_dict(
+        {
+            "frame.border": "white",
+            "selected-option": "bold",
+            "bottom-toolbar": "#ffffff bg:#333333 noreverse",
+        }
+    )
+
+    result = choice(
+        message=HTML(f"<u>{prompt}</u>:"),
+        options=[(option, option) for option in options],
+        style=style,
+        bottom_toolbar=HTML(
+            " Press <b>[Up]</b>/<b>[Down]</b> to select, <b>[Enter]</b> to accept."
+        ),
+        show_frame=~is_done,
+    )
+    return result
+
+
+def log_text(text: str):
+    print_formatted_text("")
+    print_formatted_text(HTML(text))
+
+
+def render_datetime(name: str) -> str:
+    timestamp = time.strftime("%Y%m%d%H%M")
+    sanitized_name = name.lower().replace(" ", "_")
+    return f"{timestamp}_{sanitized_name}"
+
+
+def list_text_files(folder_path: str) -> list[str]:
+    files = []
+    for file in os.listdir(folder_path):
+        if file.endswith(".txt"):
+            files.append(os.path.join(folder_path, file))
+    return files
+
+
+def clear_console():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
 def main():
+    clear_console()
+    log_startup_banner()
+
+    model_repo = pick_model()
+    if not model_repo:
+        log_text("Exiting...")
+        return
 
     try:
-        # Clear the terminal
-        os.system("cls" if os.name == "nt" else "clear")
+        model, processor, device = load_model_and_processor(model_repo)
+    except Exception as load_error:
+        log_text(f"<red>Failed to load model: {load_error}</red>")
+        return
 
-        # Show logo and help message
-        yellow_logo = Text(ASCII_LOGO, style="#face0a")
-        console.print(yellow_logo)
-        console.print(STARTING_HELP_TEXT)
+    history: List[Dict] = []
+    max_new_tokens = 64
+    default_input = ""
 
-        # Select model generation e.g. Qwen2, Qwen2.5, Qwen2.5-VL, Qwen3, etc.
-        selected_model_generation = questionary.select(
-            message="Select model",
-            choices=[Choice(generation, generation) for generation in ALL_MODELS],
-            pointer=">",
-            qmark="",
-            style=STYLE,
-        ).ask()
+    while True:
+        user_input = prompt_user_query(
+            keywords=["/help", "/switch", "/reset", "/exit"], default=default_input
+        )
+        default_input = ""
 
-        if not selected_model_generation:
-            return
-
-        # Select model variant e.g. Qwen2-0.5B-Instruct, Qwen2.5-1.5B-Instruct, etc.
-        selected_model_variant = questionary.select(
-            message="Select model variant",
-            choices=[
-                Choice(variant, variant)
-                for variant in ALL_MODELS[selected_model_generation]
-            ],
-            pointer=">",
-            qmark="",
-            style=STYLE,
-        ).ask()
-
-        if not selected_model_variant:
-            return
-
-        hf_repo_id = ALL_MODELS[selected_model_generation][selected_model_variant]
-
-        model_class = REPO_ID_TO_MODEL_CLASS.get(hf_repo_id)
-        if not model_class:
-            console.print("Invalid model variant")
-            return
-
-        # Show progress during model loading
-        with console.status(f"[bold green]Loading {hf_repo_id}...", spinner="dots"):
-            try:
-                model = model_class.from_pretrained(hf_repo_id)
-
-                # Move model to GPU if available
-                if torch.cuda.is_available():
-                    device = "cuda"
-                    model = model.to(device)
-                
-                # Compile model for faster inference
-                try:
-                    model = torch.compile(model)
-                except Exception as compile_error:
-                    console.print(f"Failed to compile model: {compile_error}", style="yellow")
-                    
-            except Exception as e:
-                console.print(f"Failed to load model: {e}")
-                return
-
-        # Create processor with vision config if it's a vision model
-        if selected_model_generation == "Qwen2.5-VL":
-            processor = Processor(
-                repo_id=hf_repo_id, vision_config=model.config.vision_config
-            )
-        elif selected_model_generation == "Qwen3V":
-            processor = Processor(
-                repo_id="Qwen/Qwen2.5-VL-7B-Instruct", vision_config=model.vision_config
-            )
-        else:
-            processor = Processor(repo_id=hf_repo_id)
-
-        if not model or not processor:
-            console.print("Failed to initialize processor. Exiting...", style="red")
-            return
-
-        # Start the interactive chat loop
-        messages = []
-        while True:
-            user_input = input("\nUSER: ").strip()
-
-            if user_input == "/exit":
-                console.print("Goodbye!")
+        if not user_input:
+            continue
+        if user_input == "/exit":
+            log_text("Goodbye!")
+            break
+        if user_input == "/help":
+            log_help_message()
+            continue
+        if user_input == "/reset":
+            history.clear()
+            log_text("<i>Conversation history cleared.</i>")
+            continue
+        if user_input == "/switch":
+            model_repo = pick_model()
+            if not model_repo:
+                log_text("Goodbye!")
                 break
-            elif user_input == "/help":
-                console.print(HELP_TEXT)
-                continue
-            elif not user_input:
-                continue
-
-            current_messages = parse_user_input(user_input)
-            messages.extend(current_messages)
-
             try:
-                print("ASSISTANT: ", end="", flush=True)
+                model, processor, device = load_model_and_processor(model_repo)
+                history.clear()
+            except Exception as load_error:
+                log_text(f"<red>Failed to load model: {load_error}</red>")
+                continue
+            log_text(f"<i>Switched to <b>{model_repo}</b>.</i>")
+            continue
 
-                response_tokens = []
-                for token in generate_local_response(
-                    messages,
-                    model,
-                    processor,
-                    selected_model_generation,
-                    stream=True,
-                ):
-                    print(token, end="", flush=True)
-                    response_tokens.append(token)
+        history.append(build_prompt_message(user_input))
+        log_text("<i>Generating response...</i>")
+        try:
+            response = generate_completion(
+                messages=history,
+                model=model,
+                processor=processor,
+                device=device,
+                max_new_tokens=max_new_tokens,
+            )
+        except Exception as generation_error:
+            log_text(f"<red>Generation failed: {generation_error}</red>")
+            history.pop()
+            continue
 
-                print()  # New line after streaming
-                response = "".join(response_tokens).strip()
-
-                messages.append({"role": "assistant", "content": response})
-
-            except Exception as e:
-                console.print(f"Error generating response: {e}", style="red")
-                if messages and messages[-1]["role"] == "user":
-                    messages.pop()
-
-    except KeyboardInterrupt:
-        console.print("\nGoodbye!")
-    except Exception as e:
-        console.print(f"Error: {e}", style="red")
-        raise
+        assistant_text = response.strip()
+        history.append(build_assistant_message(assistant_text))
+        log_text(f"<b>ASSISTANT:</b>\n{assistant_text}")
 
 
 if __name__ == "__main__":
-    app()
+    main()

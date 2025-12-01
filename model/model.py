@@ -30,26 +30,6 @@ class ModelConfig:
     n_experts_per_token: Optional[int] = None
     n_moe_mlp: Optional[int] = None
 
-    @classmethod
-    def from_pretrained(cls, hf_config: dict):
-        # Map from hugging face transformers config names
-        llm_config = hf_config["text_config"]
-        return cls(
-            n_embed=llm_config["hidden_size"],
-            n_heads=llm_config["num_attention_heads"],
-            n_kv_heads=llm_config["num_key_value_heads"],
-            n_layer=llm_config["num_hidden_layers"],
-            n_mlp=llm_config["intermediate_size"],
-            n_vocab=llm_config["vocab_size"],
-            tie_word_embeddings=hf_config["tie_word_embeddings"],
-            rope_theta=llm_config["rope_theta"],
-            rms_norm_eps=llm_config["rms_norm_eps"],
-            d_head=llm_config.get("head_dim"),
-            n_experts=llm_config.get("num_experts"),
-            n_experts_per_token=llm_config.get("num_experts_per_tok"),
-            n_moe_mlp=llm_config.get("moe_intermediate_size"),
-        )
-
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
@@ -241,28 +221,26 @@ class Model(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        v: Optional[torch.Tensor] = None,
-        v_d: Optional[dict[int, torch.Tensor]] = None,
-        v_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if v is not None and v_mask is not None:
-            x = x.clone()
-            x[v_mask] = v
+        input_embed,
+        vision_embed=None,
+        vision_residuals=None,
+        vision_mask=None,
+        position_ids=None,
+    ):
+        if vision_embed is not None and vision_mask is not None:
+            input_embed[vision_mask] = vision_embed
 
-        cos, sin = self.rotary_emb(x, position_ids)
-
+        cos, sin = self.rotary_emb(input_embed, position_ids)
         for layer_idx, layer in enumerate(self.layers):
-            x = layer(x, cos, sin)
-            if v_d and v_mask is not None:
-                visual_embed = v_d.get(layer_idx)
-                if visual_embed is not None:
-                    x = x.clone()
-                    x[v_mask] = x[v_mask] + visual_embed
+            input_embed = layer(input_embed, cos, sin)
+            if vision_residuals and vision_mask is not None:
+                # deepstack process
+                vision_residual = vision_residuals.get(layer_idx)
+                if vision_residual is not None:
+                    input_embed[vision_mask] = input_embed[vision_mask] + vision_residual
 
-        x = self.norm(x)
-        return x
+        input_embed = self.norm(input_embed)
+        return input_embed
 
 
 class Qwen3VL(nn.Module):
@@ -288,28 +266,32 @@ class Qwen3VL(nn.Module):
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = self.model.language_model.embed_tokens(input_ids)
-
-        v = None
-        v_d = None
-        v_mask = None
-        if pixels is not None:
-            pixels = pixels.to(x.dtype)
-            v, v_d = self.model.visual(pixels=pixels, d_image=d_image)
-            v = v.to(x.dtype)
-            v_d = {idx: embed.to(x.dtype) for idx, embed in v_d.items()}
-
-            image_pad_token = getattr(self.config, "image_token_id", 151655)
-            v_mask = input_ids == image_pad_token
-
+        input_embeds = self.model.language_model.embed_tokens(input_ids)
         position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
-        x = self.model.language_model(
-            x=x, v=v, v_d=v_d, v_mask=v_mask, position_ids=position_ids
-        )
+
+        if pixels is not None:
+            pixels = pixels.to(input_embeds.dtype)
+            vision_embed, vision_residuals = self.model.visual(
+                pixels=pixels, d_image=d_image
+            )
+            image_pad_token = getattr(self.config, "image_token_id", 151655)
+            vision_mask = input_ids == image_pad_token
+            output = self.model.language_model(
+                input_embed=input_embeds,
+                vision_embed=vision_embed,
+                vision_residuals=vision_residuals,
+                vision_mask=vision_mask,
+                position_ids=position_ids,
+            )
+        else:
+            output = self.model.language_model(
+                input_embed=input_embeds, position_ids=position_ids
+            )
+
         logits = (
-            x @ self.model.language_model.embed_tokens.weight.T
+            output @ self.model.language_model.embed_tokens.weight.T
             if self.lm_head is None
-            else self.lm_head(x)
+            else self.lm_head(output)
         )
         return logits
 
@@ -412,16 +394,42 @@ class Qwen3VL(nn.Module):
 
         with open(model_path / "config.json", "r") as f:
             hf_config = json.load(f)
-        config = ModelConfig.from_pretrained(hf_config)
 
-        # Load vision config if present
+        llm_config = hf_config["text_config"]
+        config = ModelConfig(
+            n_embed=llm_config["hidden_size"],
+            n_heads=llm_config["num_attention_heads"],
+            n_kv_heads=llm_config["num_key_value_heads"],
+            n_layer=llm_config["num_hidden_layers"],
+            n_mlp=llm_config["intermediate_size"],
+            n_vocab=llm_config["vocab_size"],
+            tie_word_embeddings=hf_config["tie_word_embeddings"],
+            rope_theta=llm_config["rope_theta"],
+            rms_norm_eps=llm_config["rms_norm_eps"],
+            d_head=llm_config.get("head_dim"),
+            n_experts=llm_config.get("num_experts"),
+            n_experts_per_token=llm_config.get("num_experts_per_tok"),
+            n_moe_mlp=llm_config.get("moe_intermediate_size"),
+        )
+
         vision_config = None
-        if "vision_config" in hf_config:
-            vision_config = VisionConfig.from_pretrained(hf_config)
+        vision_config_data = hf_config.get("vision_config")
+        if vision_config_data is not None:
+            vision_config = VisionConfig(
+                n_embed=vision_config_data["hidden_size"],
+                n_layer=vision_config_data["depth"],
+                n_heads=vision_config_data["num_heads"],
+                n_output_embed=vision_config_data["out_hidden_size"],
+                n_mlp=vision_config_data["intermediate_size"],
+                deepstack_visual_indexes=vision_config_data["deepstack_visual_indexes"],
+                num_position_embeddings=vision_config_data["num_position_embeddings"],
+                in_channels=vision_config_data["in_channels"],
+                temporal_patch_size=vision_config_data["temporal_patch_size"],
+                patch_size=vision_config_data["patch_size"],
+                spatial_merge_size=vision_config_data["spatial_merge_size"],
+            )
 
         model = cls(config, vision_config=vision_config)
-
-        # Use accelerate to load weights efficiently without loading all to RAM
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=str(model_path),

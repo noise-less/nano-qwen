@@ -20,24 +20,6 @@ class VisionConfig:
     patch_size: int = 16
     spatial_merge_size: int = 2
 
-    @classmethod
-    def from_pretrained(cls, hf_config: dict):
-        # Map from hugging face transformers config names
-        vision_config = hf_config["vision_config"]
-        return cls(
-            n_embed=vision_config["hidden_size"],
-            n_layer=vision_config["depth"],
-            n_heads=vision_config["num_heads"],
-            n_output_embed=vision_config["out_hidden_size"],
-            n_mlp=vision_config["intermediate_size"],
-            deepstack_visual_indexes=vision_config["deepstack_visual_indexes"],
-            num_position_embeddings=vision_config["num_position_embeddings"],
-            in_channels=vision_config["in_channels"],
-            temporal_patch_size=vision_config["temporal_patch_size"],
-            patch_size=vision_config["patch_size"],
-            spatial_merge_size=vision_config["spatial_merge_size"],
-        )
-
 
 class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
