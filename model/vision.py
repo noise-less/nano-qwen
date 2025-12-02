@@ -2,27 +2,23 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 from dataclasses import dataclass
 
 
 @dataclass
 class VisionConfig:
-    """Vision encoder configuration for Qwen2.5-VL"""
     n_embed: int
     n_layer: int
     n_heads: int
-    
-    output_n_embed: int  # same as n_embed of the downstream model/LLM
+    n_output_embed: int
+    n_mlp: int
+    deepstack_visual_indexes: list[int]
+    num_position_embeddings: int
 
-    in_channels: int
-    spatial_merge_size: int
-    spatial_patch_size: int
-    temporal_patch_size: int
-    
-    # Optional fields for Qwen2.5-VL compatibility
-    intermediate_size: int = None  # For gated MLP
-    hidden_act: str = "quick_gelu"  # Activation function
+    in_channels: int = 3
+    temporal_patch_size: int = 2
+    patch_size: int = 16
+    spatial_merge_size: int = 2
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -40,70 +36,65 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.spatial_patch_size = config.spatial_patch_size
+        self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
-        self.embed_dim = config.n_embed
+        self.n_embed = config.n_embed
 
-        kernel_size = [
-            config.temporal_patch_size,
-            config.spatial_patch_size,
-            config.spatial_patch_size,
-        ]
+        self.kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        self.stride = [self.temporal_patch_size, self.patch_size, self.patch_size]
+
         self.proj = nn.Conv3d(
-            config.in_channels,
-            config.n_embed,
-            kernel_size=kernel_size,
-            stride=kernel_size,
-            bias=False,
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.spatial_patch_size,
-            self.spatial_patch_size,
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
-        return hidden_states
-
-
-class PatchMerger(nn.Module):
-    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2, config = None) -> None:
-        super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-        
-        # Use RMSNorm for Qwen2.5-VL, LayerNorm for Qwen2-VL
-        if config and hasattr(config, 'intermediate_size') and config.intermediate_size is not None:
-            self.ln_q = RMSNorm(context_dim, eps=1e-6)
-        else:
-            self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
-            
-        self.mlp = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, dim),
+            in_channels=self.in_channels,
+            out_channels=self.n_embed,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.mlp(self.ln_q(x).view(-1, self.hidden_size))
+        x = x.view(
+            -1,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        x = self.proj(x).view(-1, self.n_embed)
+        return x
+
+
+class PatchMerger(nn.Module):
+    def __init__(
+        self, config: VisionConfig, use_postshuffle_norm: bool = False
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.n_embed * (config.spatial_merge_size**2)
+        self.use_postshuffle_norm = use_postshuffle_norm
+        self.norm = nn.LayerNorm(
+            self.hidden_size if use_postshuffle_norm else config.n_embed, eps=1e-6
+        )
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = nn.Linear(self.hidden_size, config.n_output_embed)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(
+            x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x
+        ).view(-1, self.hidden_size)
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
 
 
 class VisionAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 16) -> None:
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.n_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
+        self.n_heads = config.n_heads
+        self.head_dim = config.n_embed // config.n_heads
+        self.qkv = nn.Linear(config.n_embed, config.n_embed * 3, bias=True)
+        self.proj = nn.Linear(config.n_embed, config.n_embed)
 
     @staticmethod
     def _rotate_half(x):
@@ -127,13 +118,13 @@ class VisionAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        x: torch.Tensor,
         cu_seqlens: torch.Tensor = None,
         rotary_pos_emb: torch.Tensor = None,
     ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
+        seq_length = x.shape[0]
         q, k, v = (
-            self.qkv(hidden_states)
+            self.qkv(x)
             .reshape(seq_length, 3, self.n_heads, -1)
             .permute(1, 0, 2, 3)
             .unbind(0)
@@ -170,111 +161,124 @@ class VisionAttention(nn.Module):
         return attn_output
 
 
-class VisionMlp(nn.Module):
-    def __init__(self, config) -> None:
+class VisionMLP(nn.Module):
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        dim = config.n_embed
-
-        # Check if this is Qwen2.5-VL (has intermediate_size) or Qwen2-VL
-        if config.intermediate_size is not None:
-            # Qwen2.5-VL: Gated MLP structure
-            self.gate_proj = nn.Linear(dim, config.intermediate_size, bias=True)
-            self.up_proj = nn.Linear(dim, config.intermediate_size, bias=True)
-            self.down_proj = nn.Linear(config.intermediate_size, dim, bias=True)
-            self.act_fn = self._get_activation_fn(config.hidden_act)
-            self.is_gated = True
-        else:
-            # Qwen2-VL: Simple MLP structure
-            self.fc1 = nn.Linear(dim, 4 * dim)
-            self.fc2 = nn.Linear(4 * dim, dim)
-            self.is_gated = False
+        self.linear_fc1 = nn.Linear(config.n_embed, config.n_mlp, bias=True)
+        self.linear_fc2 = nn.Linear(config.n_mlp, config.n_embed, bias=True)
+        self.act_fn = nn.GELU(approximate="tanh")  # gelu_pytorch_tanh
 
     def forward(self, x) -> torch.Tensor:
-        # Ensure consistent dtype
-        target_dtype = x.dtype
-
-        if self.is_gated:
-            # Qwen2.5-VL gated MLP
-            gate_out = self.act_fn(self.gate_proj(x.to(target_dtype)))
-            up_out = self.up_proj(x.to(target_dtype))
-            return self.down_proj(gate_out * up_out).to(target_dtype)
-        else:
-            # Qwen2-VL simple MLP
-            return self.fc2(self._quick_gelu(self.fc1(x.to(target_dtype)))).to(
-                target_dtype
-            )
-
-    @staticmethod
-    def _quick_gelu(x):
-        return x * torch.sigmoid(1.702 * x)
-
-    def _get_activation_fn(self, act_name: str):
-        if act_name == "silu":
-            return F.silu
-        elif act_name == "quick_gelu":
-            return self._quick_gelu
-        else:
-            raise ValueError(f"Unsupported activation: {act_name}")
+        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+class VisionBlock(nn.Module):
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.norm1 = nn.LayerNorm(config.n_embed, eps=1e-6)
+        self.norm2 = nn.LayerNorm(config.n_embed, eps=1e-6)
+        self.attn = VisionAttention(config)
+        self.mlp = VisionMLP(config)
 
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-
-class Qwen2VLVisionBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Use RMSNorm for Qwen2.5-VL compatibility or LayerNorm for Qwen2-VL
-        if config.intermediate_size is not None:
-            # Qwen2.5-VL uses RMSNorm
-            self.norm1 = RMSNorm(config.n_embed, eps=1e-6)
-            self.norm2 = RMSNorm(config.n_embed, eps=1e-6)
-        else:
-            # Qwen2-VL uses LayerNorm
-            self.norm1 = nn.LayerNorm(config.n_embed, eps=1e-6)
-            self.norm2 = nn.LayerNorm(config.n_embed, eps=1e-6)
-
-        self.ln_1 = nn.LayerNorm(config.n_embed, eps=1e-6)  # Keep for compatibility
-        self.attn = VisionAttention(config.n_embed, config.n_heads)
-        self.mlp = VisionMlp(config)
-
-    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
+    def forward(self, x, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
+        x = x + self.attn(
+            self.norm1(x), cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
-class Qwen2VLVisionEncoder(nn.Module):
-    def __init__(self, config):
+class VisionEncoder(nn.Module):
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
+        self.config = config
         self.patch_embed = PatchEmbed(config=config)
+
+        # Learnable position embeddings
+        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.n_embed)
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
+
         self.blocks = nn.ModuleList(
-            [Qwen2VLVisionBlock(config) for _ in range(config.n_layer)]
+            [VisionBlock(config) for _ in range(config.n_layer)]
         )
-        self.merger = PatchMerger(
-            dim=config.output_n_embed,
-            context_dim=config.n_embed,
-            spatial_merge_size=config.spatial_merge_size,
-            config=config,
-        )
+        self.merger = PatchMerger(config=config, use_postshuffle_norm=False)
         head_dim = config.n_embed // config.n_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
         self.spatial_merge_size = config.spatial_merge_size
-        self.in_channels = config.in_channels
+        self.deepstack_visual_indexes = config.deepstack_visual_indexes
+        self.deepstack_merger_list = nn.ModuleList(
+            [
+                PatchMerger(config, use_postshuffle_norm=True)
+                for _ in range(len(config.deepstack_visual_indexes))
+            ]
+        )
+
+    def fast_pos_embed_interpolate(self, d_image: torch.Tensor) -> torch.Tensor:
+        """Interpolate learned position embeddings to match image dimensions."""
+        grid_ts, grid_hs, grid_ws = d_image[:, 0], d_image[:, 1], d_image[:, 2]
+        device = d_image.device
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
+
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+        weight_tensor = torch.tensor(
+            weight_list, dtype=self.pos_embed.weight.dtype, device=device
+        )
+        pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        patch_pos_embeds = patch_pos_embeds.split(
+            [h * w for h, w in zip(grid_hs, grid_ws)]
+        )
+
+        patch_pos_embeds_permute = []
+        merge_size = self.config.spatial_merge_size
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            pos_embed = pos_embed.repeat(t, 1)
+            pos_embed = (
+                pos_embed.view(
+                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
+                )
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+            patch_pos_embeds_permute.append(pos_embed)
+
+        return torch.cat(patch_pos_embeds_permute, dim=0)
 
     def rot_pos_emb(self, d_image: torch.Tensor) -> torch.Tensor:
         pos_ids = []
@@ -298,17 +302,30 @@ class Qwen2VLVisionEncoder(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    def forward(self, pixels: torch.Tensor, d_image: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pixels: torch.Tensor, d_image: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         hidden_states = self.patch_embed(pixels)
+
+        # Add learnable position embeddings
+        pos_embeds = self.fast_pos_embed_interpolate(d_image)
+        hidden_states = hidden_states + pos_embeds
+
         rotary_pos_emb = self.rot_pos_emb(d_image)
         cu_seqlens = torch.repeat_interleave(
             d_image[:, 1] * d_image[:, 2], d_image[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        for blk in self.blocks:
+        deepstack_features: dict[int, torch.Tensor] = {}
+        for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
             )
+            if layer_num in self.deepstack_visual_indexes:
+                ds_idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_features[layer_num] = self.deepstack_merger_list[ds_idx](
+                    hidden_states
+                )
 
-        return self.merger(hidden_states)
+        return self.merger(hidden_states), deepstack_features
