@@ -12,7 +12,11 @@
 
 如果你觉得 Hugging Face 的代码冗长且难以阅读，这个仓库正适合你！
 
-欢迎大家加我的 [Discord 群](https://discord.gg/sBNnqP9gaY)继续讨论！
+若需 `Qwen3`（纯文本）与 `Qwen2.5 VL` 支持，请查看[这个 branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5)。
+
+若需 `DeepSeek R1`，请查看[这个仓库](https://github.com/Emericen/tiny-deepseek-r1)。
+
+欢迎大家加我的 [Discord ](https://discord.gg/sBNnqP9gaY)继续讨论！
 
 ## 🦋 快速开始
 

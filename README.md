@@ -3,31 +3,27 @@
 </p>
 
 <p align="center">
-    <img src="data/chat.jpg" alt="Tiny Qwen Interactive Chat">
+    <img src="test/data/banner-1.png" alt="Tiny Qwen Interactive Chat">
 </p>
 
 ## ✨ Tiny Qwen
 
-A minimal, easy-to-read PyTorch re-implementation of `Qwen3-VL`, supporting both text + vision as well as dense and mixture of experts.
+A minimal, easy-to-read PyTorch re-implementation of of `Qwen3-VL`. Supports text and vision as well as dense and mixture of experts.
 
-If you find Hugging Face code verbose and challenging to interpret, this repo is for you!
+For `Qwen3` (text-only) and `Qwen2.5 VL` support, see [this branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5). 
+
+For `DeepSeek R1`, see [this repo](https://github.com/Emericen/tiny-deepseek-r1).
 
 Join my [Discord channel](https://discord.gg/sBNnqP9gaY) for more discussion!
 
-For `Qwen3` text-only version and `Qwen2.5 VL` of this repo, see [this branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5).
+## 🎇 Quick Start
 
-## 🦋 Quick Start
-
-I recommend using `uv` and creating a virtual environment:
+Create a virtual environment:
 
 ```bash
-pip install uv && uv venv
-
-# activate the environment
-source .venv/bin/activate # Linux/macOS
-.venv\Scripts\activate # Windows
-
-# install dependencies
+pip install uv 
+uv venv
+source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
@@ -37,13 +33,7 @@ Launch the interactive chat:
 python run.py
 ```
 
-**Note:** `Qwen3` is text-only. Use `@path/to/image.jpg` to reference images with `Qwen2.5-VL`.
-
-```
-USER: @data/test-img-1.jpg tell me what you see in this image?
-✓ Found image: data/test-img-1.jpg
-ASSISTANT: The image shows a vibrant sunflower field with a close-up of a sunflower...
-```
+**Note:** Use `@relative/path/to/image.jpg` to reference images.
 
 ## 📝 Code Examples
 
