@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-    <img src="test/data/banner.png" alt="Tiny Qwen 交互式对话">
+    <img src="test/data/banner.png" alt="Tiny Qwen 交互式对话" width="90%">
 </p>
 
 # ✨ Tiny Qwen
