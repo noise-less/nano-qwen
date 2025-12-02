@@ -94,7 +94,6 @@ def parse_user_input(text):
         image_path = match.group(1)
         if os.path.exists(image_path):
             content.append({"type": "image", "image": image_path})
-            console.print(f"✓ Found image: {image_path}", style="green")
         else:
             console.print(f"Warning: Image not found: {image_path}", style="yellow")
 
@@ -207,7 +206,7 @@ def main():
 
             try:
                 response_segments = []
-                print("ASSISTANT: ", end="", flush=True)
+                print("QWEN: ", end="", flush=True)
                 for segment in generate_local_response(messages, model, processor):
                     print(segment, end="", flush=True)
                     response_segments.append(segment)

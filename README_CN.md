@@ -10,7 +10,7 @@
 
 一个简洁易读的 PyTorch 代码库，用于重写 `Qwen3-VL`，同时支持文本与视觉模态，并兼容稠密和混合专家架构。
 
-如果你觉得 Hugging Face 的代码冗长且难以阅读，这个仓库正适合你！
+如果你觉得 Hugging Face 的代码难读，那你来对地方了
 
 若需 `Qwen3`（纯文本）与 `Qwen2.5 VL` 支持，请查看[这个 branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5)。
 
@@ -18,34 +18,24 @@
 
 欢迎大家加我的 [Discord ](https://discord.gg/sBNnqP9gaY)继续讨论！
 
-## 🦋 快速开始
+## 🎇 快速开始
 
 推荐使用 `uv` 创建并隔离虚拟环境：
 
 ```bash
-pip install uv && uv venv
-
-# 激活环境
-source .venv/bin/activate # Linux/macOS
-.venv\Scripts\activate # Windows
-
-# 安装依赖
+pip install uv 
+uv venv
+source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-启动交互式对话：
+启动CLI：
 
 ```bash
 python run.py
 ```
 
-**注意：** `Qwen3` 仅支持文本。若要在 `Qwen2.5-VL` 中引用图片，请使用 `@path/to/image.jpg`。
-
-```
-USER: @data/test-img-1.jpg 告诉我这张图片里有什么？
-✓ Found image: data/test-img-1.jpg
-ASSISTANT: 这张图片展示了充满活力的向日葵田...
-```
+**注意：** 引用图片要用 `@relative/path/to/image.jpg`。
 
 ## 📝 代码示例
 
