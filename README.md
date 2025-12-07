@@ -1,43 +1,33 @@
-<p align="left">
-    English | <a href="README_CN.md">中文</a>
-</p>
+# Nano Qwen
 
-<p align="center">
-    <img src="test/data/banner.png" alt="Tiny Qwen Interactive Chat" width="90%">
-</p>
+A minimal, PyTorch re‑implementation of **Qwen3‑VL**, supporting both text and vision. Includes dense and MoE variants.
 
-## ✨ Tiny Qwen
+For older `Qwen3` (text‑only) and `Qwen2.5‑VL` support, visit the legacy branch.
 
-A minimal, easy-to-read PyTorch re-implementation of of `Qwen3-VL`. Supports text and vision as well as dense and mixture of experts.
+---
 
-For `Qwen3` (text-only) and `Qwen2.5 VL` support, see [this branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5). 
+## 🚀 Quick Start
 
-For `DeepSeek R1`, see [this repo](https://github.com/Emericen/tiny-deepseek-r1).
-
-Join my [Discord channel](https://discord.gg/sBNnqP9gaY) for more discussion!
-
-## 🎇 Quick Start
-
-Create a virtual environment:
+Create and activate a virtual environment:
 
 ```bash
-pip install uv 
+pip install uv
 uv venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-Launch the interactive chat:
+Run the chat interface:
 
 ```bash
 python run.py
 ```
 
-**Note:** Use `@relative/path/to/image.jpg` to reference images.
+---
 
-## 📝 Code Examples
+## 📘 Code Example
 
-Using `Qwen3VL` class in code:
+Using the `Qwen3VL` model directly:
 
 ```python
 from PIL import Image
@@ -73,3 +63,9 @@ for token_id in model.generate_stream(**inputs, max_new_tokens=64):
     print(processor.tokenizer.decode([token_id]), end="", flush=True)
 print()
 ```
+
+---
+
+## 📌 Disclaimer
+
+This project is a modified and rebranded fork of **Emericen/tiny-qwen**.
